@@ -15,6 +15,10 @@ const uint32_t LOSS_TIMEOUT_MS = 500;   // adjust as needed
 volatile uint32_t lastHostStepTime = 0;
 volatile bool hostTimedOut = false;
 
+// How close (in degrees) the sine phase must be to a cardinal axis
+// before switching to 8-step mode. Tune as needed.
+#define EIGHTSTEP_ALIGN_TOL_DEG   3.0f
+
 // Pins
 const int PIN_A_PH   = 4;   // Phase (direction) for winding A
 const int PIN_A_EN   = 2;   // Enable (PWM) for winding A
@@ -22,7 +26,7 @@ const int PIN_B_PH   = 8;   // Phase (direction) for winding B
 const int PIN_B_EN   = 3;   // Enable (PWM) for winding B
 const int PIN_LED    = 13;
 
-const int BPWM_FREQ = 15000;
+const int BPWM_FREQ = 25000;
 
 // Current sense (CS) pins from DRV8874 boards
 // Teensy 4.x: A1 = GPIO 15, A2 = GPIO 16
@@ -35,7 +39,8 @@ const int PIN_HOST_FREQMSR = 22;  // FreqMeasure API
 
 const int PIN_RATE_PWM = 11;              // fixed hardware PWM test source
 const uint32_t RATE_PWM_FREQ_HZ = 51200/240;  // FOR TESTING
-const float transFreqHz = 50000.f;  // Frequency for sine<>square transition
+const float transFreqHz = 25000.f;  // Frequency for sine<>square transition
+bool pendingEightStep = false;
 
 const int PIN_ISR_TOGGLE = 10;  // scope probe (test signal output for logic analyzer)
 
@@ -64,6 +69,7 @@ volatile int8_t enableDrv     = HIGH;   // Host enableDrv
 volatile int8_t enableDrv_    = LOW;    // Host enableDrv inverse (bar)
 volatile unsigned long freqMeasure   = 0;   // Host step counts per second (rate)
 volatile float         freqMeasureHz = 0.f; // Host step frequency
+volatile int step8 = 0;
 
 // Limit pwmGain to protect DRV8874 (max 2.1A)
 const float PWM_GAIN_MAX = 1.0f;        // Empirical safe max (adjust as needed)
@@ -96,10 +102,10 @@ volatile DriveMode currentMode = MODE_SINE;
 static float sineLUT[cntLUT];
 // 8-step square wave direction and level
 // Step index: 0..7 corresponds to 0°,45°,90°,...,315° of phaseA
-static const int8_t eighthStepActA[8] = { HIGH, HIGH,  LOW, HIGH, HIGH, HIGH, LOW,  HIGH };
-static const int8_t eighthStepDirA[8] = {  LOW,  LOW,  LOW, HIGH, HIGH, HIGH, HIGH,  LOW };
-static const int8_t eighthStepActB[8] = {  LOW, HIGH, HIGH, HIGH,  LOW, HIGH, HIGH, HIGH };
-static const int8_t eighthStepDirB[8] = {  LOW, HIGH, HIGH, HIGH, HIGH,  LOW,  LOW,  LOW };
+static const int8_t eighthStepActA[8] = {  LOW, HIGH, HIGH, HIGH,  LOW, HIGH, HIGH, HIGH };
+static const int8_t eighthStepDirA[8] = { HIGH,  LOW,  LOW,  LOW,  LOW, HIGH, HIGH, HIGH };
+static const int8_t eighthStepActB[8] = { HIGH, HIGH,  LOW, HIGH, HIGH, HIGH,  LOW, HIGH };
+static const int8_t eighthStepDirB[8] = {  LOW,  LOW,  LOW, HIGH, HIGH, HIGH, HIGH,  LOW };
 
 static void setupLUTs()
 {
@@ -208,9 +214,18 @@ void stepISR()
 
   // --- Mode selection based on slewed frequency ---
   // You can add hysteresis here if you like
-  DriveMode desiredMode = (slewFreqHz > transFreqHz) ? MODE_EIGHTH : MODE_SINE;
+  if ((slewFreqHz > transFreqHz) && (currentMode == MODE_SINE))
+    pendingEightStep = true;   // request transition
+    // stay in sine mode until alignment occurs
+  else if ((slewFreqHz < transFreqHz) && (currentMode == MODE_EIGHTH))
+  {
+    phaseA_f = step8 * 45.0f;
+    currentMode = MODE_SINE;
+  }
+//  DriveMode desiredMode = (slewFreqHz > transFreqHz) ? MODE_EIGHTH : MODE_SINE;
 
   // Detect mode transition
+/*
   if (desiredMode != currentMode) {
     // On transition into 8th-step, snap phase to a legal 45° boundary
     if (desiredMode == MODE_EIGHTH) {
@@ -220,6 +235,7 @@ void stepISR()
     // sine LUT will just use that exact phase.
     currentMode = desiredMode;
   }
+*/
 
   // 3) Compute channel B (quarter period ahead) after any possible snap
   float phaseB_f = phaseA_f + 90.f;
@@ -329,6 +345,29 @@ void stepISR()
         analogWrite(PIN_B_EN, (uint16_t)valB);
       }
     }
+
+    // --- Handle sine → 8-step transition alignment ---
+    if (pendingEightStep)
+    {
+      float p = phaseA_f;   // already normalized by your code
+
+      // Check for alignment with 0°, 90°, 180°, 270°
+      if (fabsf(p -   0.0f) < EIGHTSTEP_ALIGN_TOL_DEG ||
+          fabsf(p -  90.0f) < EIGHTSTEP_ALIGN_TOL_DEG ||
+          fabsf(p - 180.0f) < EIGHTSTEP_ALIGN_TOL_DEG ||
+          fabsf(p - 270.0f) < EIGHTSTEP_ALIGN_TOL_DEG)
+      {
+        // Snap to exact cardinal angle
+        if (p < 45.0f)       phaseA_f = 0.0f;
+        else if (p < 135.0f) phaseA_f = 90.0f;
+        else if (p < 225.0f) phaseA_f = 180.0f;
+        else                 phaseA_f = 270.0f;
+
+        // Now switch modes
+        currentMode = MODE_EIGHTH;
+        pendingEightStep = false;
+      }
+    }    
   }
 
   // 5) ADC
