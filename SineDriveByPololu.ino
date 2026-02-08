@@ -10,8 +10,10 @@
 #include <math.h>
 #include <FreqMeasure.h>
 
-// Loss-of-pulses timeout (milliseconds)
-const unsigned long LOSS_TIMEOUT_MS = 1000UL; // 1 second  TODO
+// --- Host step loss timeout ---
+const uint32_t LOSS_TIMEOUT_MS = 500;   // adjust as needed
+volatile uint32_t lastHostStepTime = 0;
+volatile bool hostTimedOut = false;
 
 // Pins
 const int PIN_A_PH   = 4;   // Phase (direction) for winding A
@@ -172,6 +174,17 @@ void stepISR()
   {
     freqMeasure   = FreqMeasure.read();
     freqMeasureHz = FreqMeasure.countToFrequency(freqMeasure);
+
+    // Host is alive: record activity and clear timeout
+    lastHostStepTime = millis();
+    hostTimedOut = false;
+  }
+
+  // --- Host timeout-aware target frequency ---
+  if (hostTimedOut)
+  {
+    // Force a controlled ramp-down
+    freqMeasureHz = 0.0f;
   }
 
   // Slew output frequency toward input frequency
@@ -217,7 +230,16 @@ void stepISR()
   if (pwmGain > PWM_GAIN_MAX) pwmGain = PWM_GAIN_MAX;
 
   // 4) Lookup waveform values based on current mode
-  if (currentMode == MODE_EIGHTH) 
+  // --- Safe disable when timed out and fully stopped ---
+  if (hostTimedOut && (slewFreqHz < 1.f))
+  {
+    // Motor has fully ramped down; now it's safe to brake
+    pinMode(PIN_A_EN, OUTPUT);
+    digitalWriteFast(PIN_A_EN, LOW);
+    pinMode(PIN_B_EN, OUTPUT);
+    digitalWriteFast(PIN_B_EN, LOW);
+  }
+  else if (currentMode == MODE_EIGHTH) 
   {
     // True 8-step square: derive step index from phaseA
     float phaseNorm = phaseA_f;
@@ -235,7 +257,7 @@ void stepISR()
     digitalWriteFast(PIN_B_EN, eighthStepActB[step8]);
     digitalWriteFast(PIN_B_PH, eighthStepDirB[step8]);
   } 
-  else 
+  else if (currentMode == MODE_SINE)
   {
     // Sine mode: use LUT
     int idxA = (int)(phaseA_f * phaseConv);
@@ -387,6 +409,16 @@ void loop() {
     Serial.println();
 
     lastDebugMs = millis();
+  }
+
+  // --- Host step loss detection ---
+  uint32_t now = millis();
+
+  if (!hostTimedOut && ((now - lastHostStepTime) > LOSS_TIMEOUT_MS))
+  {
+      hostTimedOut = true;
+      // We do NOT disable the motor here.
+      // We only tell the ISR to ramp down to zero.
   }
 
   delay(1);
