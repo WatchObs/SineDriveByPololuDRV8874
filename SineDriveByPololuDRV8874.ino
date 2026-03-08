@@ -21,22 +21,21 @@ volatile bool hostTimedOut = false;
 #define EIGHTSTEP_ALIGN_TOL_DEG   3.0f
 
 // Pins
-const int PIN_A_PH   = 4;   // Phase (direction) for winding A
-const int PIN_A_EN   = 2;   // Enable (PWM) for winding A
-const int PIN_B_PH   = 8;   // Phase (direction) for winding B
-const int PIN_B_EN   = 3;   // Enable (PWM) for winding B
+const int PIN_A_PH   = 8;   // Phase (direction) for winding A
+const int PIN_A_EN   = 3;   // Enable (PWM) for winding A
+const int PIN_B_PH   = 4;   // Phase (direction) for winding B
+const int PIN_B_EN   = 2;   // Enable (PWM) for winding B
 const int PIN_LED    = 13;
 
 const int BPWM_FREQ = 12000;
 
 // Current sense (CS) pins from DRV8874 boards
-// Teensy 4.x: A1 = GPIO 15, A2 = GPIO 16
-const int PIN_CS_A = A1; // DRV8874 CS for winding A (A1, GPIO 15)
-const int PIN_CS_B = A2; // DRV8874 CS for winding B (A2, GPIO 16)
+const int PIN_CS_A = 16; // DRV8874 CS for winding A
+const int PIN_CS_B = 15; // DRV8874 CS for winding B
 
 const int PIN_HOST_ENABLE  = 20;
 const int PIN_HOST_DIR     = 21;
-const int PIN_HOST_FREQMSR = 22;  // Host simulation by loopback
+const int PIN_HOST_FREQMSR = 22;  // Host requested rate (freq) used by FreqMeasure API
 
 const int PIN_ISR_TOGGLE   = 10;  // scope probe (test signal output for logic analyzer)
 
@@ -49,7 +48,7 @@ const int   PWM_BITS        = 12;             // PWM resolution
 const float PWM_MAG         = (float)(pow(2, PWM_BITS)-0); // PWM magnitude
 
 const int      PIN_RATE_PWM     = 11;             // fixed hardware PWM test source
-const uint32_t RATE_PWM_FREQ_HZ = uStepPerTurn/32; // FOR TESTING
+const uint32_t RATE_PWM_FREQ_HZ = uStepPerTurn/240; // FOR TESTING
 const float    transFreqHz      = uStepPerTurn*2; // Frequency for sine<>square transition
 bool           pendingEightStep = false;
 
@@ -77,10 +76,11 @@ volatile int    releaseForUse = 0;      // Stepper released for normal drive
 volatile float  freqMeasureHz = 0.f;    // Host step frequency
 volatile unsigned long freqMeasure = 0; // Host step counts per second (rate)
 
-// Limit pwmGain to protect DRV8874 (max 2.1A)
-const float PWM_GAIN_MAX = 1.0f;        // Empirical safe max (adjust as needed)
-const float PWM_GAIN_MIN = 0.1f;        // Empirical minimum (adjust to achieve motor rating)
-volatile float pwmGain   = 0.2f;        // Gain on PWM amplitude
+// Limit dutyCyc to protect DRV8874 (max 2.1A)
+const float    PWM_GAIN_MAX = 1.0f;     // Empirical safe max (adjust as needed)
+const float    PWM_GAIN_MIN = 0.0f;     // Empirical minimum (adjust to achieve motor rating)
+volatile float dutyA        = 0.0f;     // Duty cycle phase A
+volatile float dutyB        = 0.0f;     // Duty cycle phase 
 
 // Slew-limited output frequency for phase integration
 volatile float slewFreqHz = 0.f;        // deg/sec
@@ -88,15 +88,18 @@ const float SLEW_RATE_HZ_PER_ISR = (float)uStepPerTurn * 2.5f / (float)ISR_FREQ_
 
 // Driver motor currents
 const    float convCS   = (3.3f/(float)pow(2,ADC_BITS)) * (1.0f/1.1f); // CS scaling: 1.1V/A
-volatile float avgCurrA = 0.f;  // Filtered current A
-volatile float avgCurrB = 0.f;  // Filtered current B
+volatile float currAAvg = 0.f;  // Filtered current A
+volatile float currBAvg = 0.f;  // Filtered current B
 volatile float currA    = 0.f;  // Motor coil current A
 volatile float currB    = 0.f;  // Motor coil current B
 volatile float currD    = 0.f;  // Rotor frame current - D axis
 volatile float currQ    = 0.f;  // Rotor frame current - Q axis
-volatile float reqCurrQ = 1.5f; // Requested rotor frame current - Q axis
-volatile float polA     = 1.f;  // Polarity of current A
-volatile float polB     = 1.f;  // Polarity of current B
+volatile float currDReq = 0.0f; // Requested rotor frame current - D axis
+volatile float currQReq = 0.0f; // Requested rotor frame current - Q axis
+volatile float currPolA = 1.f;  // Polarity of current A
+volatile float currPolB = 1.f;  // Polarity of current B
+volatile float dutyD    = 0.f;  // Duty cycle D 
+volatile float dutyQ    = 0.f;  // Duty cycle Q
 
 // --- Mode tracking for LUT switching ---
 enum DriveMode : uint8_t 
@@ -119,25 +122,31 @@ const int PIN_ENC_A   = 1; // Quadrature A
 const int PIN_ENC_B   = 0; // Quadrature B
 const int PIN_ENC_IDX = 9; // Index (Z) -- changed from 24 to 9
 
+#define ENC_CNTS 20
+
 Encoder motorEncoder(PIN_ENC_A, PIN_ENC_B);
+volatile long  encCnt[ENC_CNTS]  = {0};
 volatile int   encoderIndex  = -1;
-volatile long  encoderCount  = 0;
-volatile float encoderAngle  = 0.f;
+volatile float encDeg        = 0.f;
 volatile float encoderOffset = 0.f;  // Encoder offset (to magnetic cycle)
-volatile float commAngle     = 0.f;  // Commutation angle
+volatile float encCntDiff    = 0.f;  // Encoder difference (for velocity)
+volatile float commDeg       = 0.f;  // Commutation angle
 static int     encQuadRez    = 2500 * 4; 
+volatile float motorVel      = 0.f;  // Motor velocity
 
 static void setupLUTs()
 {
   for (int n = 0; n < cntLUT; ++n)
   {
     float a = sinf((float)n * 2.0f * M_PI / (float)cntLUT);
-    sineLUT[n] = a * PWM_MAG;
+    sineLUT[n] = a; // * PWM_MAG;
   }
 }
 
-void sineDRV8874(float val, int PIN_PH, int PIN_EN)
+void dutyDRV8874(float val, int PIN_PH, int PIN_EN)
 {
+  val *= PWM_MAG;
+
   if (val < 0.) 
   {
     digitalWrite(PIN_PH, LOW); // Reverse
@@ -171,7 +180,7 @@ void sineDRV8874(float val, int PIN_PH, int PIN_EN)
 void encoderIndexISR() 
 {
   motorEncoder.write(0); // Zero the encoder position on index pulse
-  encoderCount = 0;      // Zero the tracked position
+  encCnt[0] = 0;         // Zero the tracked position
   encoderIndex++;
 }
 
@@ -180,11 +189,30 @@ void stepISR()
 {
   digitalWriteFast(PIN_ISR_TOGGLE, HIGH);  // Debug
 
-  encoderCount = motorEncoder.read() % encQuadRez;
-  encoderAngle = -(float)encoderCount * (360.0f / (float)encQuadRez) - encoderOffset;
-  float temp   = encoderAngle * magCyclesPerRev * (1.f/360.f);
-  commAngle    =  (temp - (int)temp) * 2 * M_PI - M_PI;
+  // Motor currents
+  currAAvg += (analogRead(PIN_CS_A) * convCS - currAAvg) * 0.1f;
+  currBAvg += (analogRead(PIN_CS_B) * convCS - currBAvg) * 0.1f;
 
+  // Apply sign to measured current
+  currA = currAAvg * currPolA;
+  currB = currBAvg * currPolB;
+
+  // Encoder feedback
+  for (int n=ENC_CNTS-2; n>=0;n--) encCnt[n+1] = encCnt[n];
+  encCnt[0] = motorEncoder.read() % encQuadRez;
+  encDeg = -(float)encCnt[0] * (360.0f / (float)encQuadRez) - encoderOffset;
+
+  encCntDiff = ((encCnt[0] - encCnt[ENC_CNTS-1])/ENC_CNTS) * 360.f / encQuadRez;
+  motorVel += ((float)encCntDiff * ISR_FREQ_HZ - motorVel) * 0.01f;
+
+  float temp = encDeg * magCyclesPerRev * (1.f/360.f);
+  commDeg = (temp - (int)temp) * 2 * M_PI;
+
+  // d-q currents
+  currD =  cosf(commDeg) * currA + sinf(commDeg) * currB;
+  currQ = -sinf(commDeg) * currA + cosf(commDeg) * currB;
+
+  // Signal frequency (commanded rate and direction)
   if (releaseForUse)
   {
     // 1) Sample host step frequency, direction and enable
@@ -226,7 +254,7 @@ void stepISR()
         demandAngle += dirSign * Rate;
       else
       {
-        demandAngle = encoderAngle + dirSign * Rate;
+        demandAngle = encDeg + dirSign * Rate;
         servoDelay  = 0;
       }
 
@@ -237,7 +265,7 @@ void stepISR()
         servoDelay++;
       else if (LowSpeed)   // Low speed
       {
-        pE = demandAngle - encoderAngle;
+        pE = demandAngle - encDeg;
         if      (pE >=  180.f) pE -= 360.f;
         else if (pE <= -180.f) pE += 360.f;
   
@@ -258,8 +286,8 @@ void stepISR()
       else if (demandAngle <    0.f) demandAngle += 360.f;
     }
 
-const float SERVO_KP  = 1.0f; // Position error gain
-const float SERVO_KPI = 1.0f; // Integrated position error gain
+    const float SERVO_KP  = 0.0f; // Position error gain
+    const float SERVO_KPI = 0.0f; // Integrated position error gain
 
     float phase = (demandAngle + SERVO_KP * pE + SERVO_KPI * pEI) * magCyclesPerRev * (1.f/360.f);
     phaseAdv = dirSign * slewFreqHz * 0.0000f;
@@ -268,7 +296,7 @@ const float SERVO_KPI = 1.0f; // Integrated position error gain
   else
   {
     servoDelay  = 0;
-    demandAngle = encoderAngle;
+    demandAngle = encDeg;
     pE  = 0.f;
     pEI = 0.f;
   }
@@ -287,8 +315,8 @@ const float SERVO_KPI = 1.0f; // Integrated position error gain
   } // releaseForUse
 
   // 3) Compute channel B (quarter period ahead) after any possible snap
-  float phaseB_f = phaseA_f + 90.f;
-  if (phaseB_f >= 360.f) phaseB_f -= 360.f;
+//  float phaseB_f = phaseA_f + 90.f;
+//  if (phaseB_f >= 360.f) phaseB_f -= 360.f;
 
   // 4) Lookup waveform values based on current mode
   // --- Safe disable when timed out and fully stopped ---
@@ -303,29 +331,50 @@ const float SERVO_KPI = 1.0f; // Integrated position error gain
   else if (currentMode == MODE_SINE)
   {
     // Sine mode: use LUT
-    int idxA = (int)(phaseA_f * phaseConv);
-    int idxB = (int)(phaseB_f * phaseConv);
+//    int idxA = (int)(phaseA_f * phaseConv);
+//    int idxB = (int)(phaseB_f * phaseConv);
 
-    idxA %= cntLUT;
-    idxB %= cntLUT;
-    if (idxA < 0) idxA += cntLUT;
-    if (idxB < 0) idxB += cntLUT;
+//    idxA %= cntLUT;
+//    idxB %= cntLUT;
+//    if (idxA < 0) idxA += cntLUT;
+//    if (idxB < 0) idxB += cntLUT;
 
     // Fade PWM levels to control current
-    if (releaseForUse) pwmGain += (reqCurrQ - currQ) * 0.0001f;
-    if      (pwmGain > PWM_GAIN_MAX) pwmGain = PWM_GAIN_MAX;
-    else if (pwmGain < PWM_GAIN_MIN) pwmGain = PWM_GAIN_MIN;
+    float magAngle = 0.f;
 
-    float valA = sineLUT[idxA] * pwmGain;
-    float valB = sineLUT[idxB] * pwmGain;
+    if (releaseForUse) 
+    {
+      currDReq = 0.0f;
+      currQReq = 0.5f;
+
+      dutyD  = 0.0;
+      dutyQ  = 1.0f; //+= (currQReq - currQ) * 0.0001f;
+      if      (dutyQ > PWM_GAIN_MAX) dutyQ = PWM_GAIN_MAX;
+      else if (dutyQ < PWM_GAIN_MIN) dutyQ = PWM_GAIN_MIN;
+
+      magAngle = commDeg + M_PI * .075f;  // Radians
+    }
+    else
+    {
+      dutyD = 0.15;
+      dutyQ = 0.f;
+//    dutyA = sineLUT[idxA] * dutyCyc;
+//    dutyB = sineLUT[idxB] * dutyCyc;
+      magAngle = phaseA_f * (M_PI / 180.f);  // Convert to Radians
+    }
+
+//  magAngle = phaseA_f * (M_PI / 180.f);
+    
+    dutyA = cosf(magAngle) * dutyD - sinf(magAngle) * dutyQ;
+    dutyB = sinf(magAngle) * dutyD + cosf(magAngle) * dutyQ; 
+
+    currPolA = (dutyA < 0.f) ? -1. : 1.;
+    currPolB = (dutyB < 0.f) ? -1. : 1.;
 
     // DRV8874 PH/EN mode: set phase and PWM for each winding
-    sineDRV8874(valA, PIN_A_PH, PIN_A_EN);    
-    sineDRV8874(valB, PIN_B_PH, PIN_B_EN);   
+    dutyDRV8874(dutyA, PIN_A_PH, PIN_A_EN);    
+    dutyDRV8874(dutyB, PIN_B_PH, PIN_B_EN);   
  
-    polA = (valA < 0.f) ? 1. : -1.;
-    polB = (valB < 0.f) ? 1. : -1.;
-
     // --- Handle sine → 8-step transition alignment ---
     if (pendingEightStep)
     {
@@ -356,30 +405,9 @@ const float SERVO_KPI = 1.0f; // Integrated position error gain
     digitalWriteFast(PIN_B_EN, eighthStepAct[step8B]);
     digitalWriteFast(PIN_B_PH, eighthStepDir[step8B]);
 
-    polA = (eighthStepDir[step8A] == HIGH) ? 1.f : -1.f;
-    polB = (eighthStepDir[step8B] == HIGH) ? 1.f : -1.f;
+    currPolA = (eighthStepDir[step8A] == HIGH) ? 1.f : -1.f;
+    currPolB = (eighthStepDir[step8B] == HIGH) ? 1.f : -1.f;
   } 
-  // 5) ADC
-  static int subBandAdc = 0;
-  if (subBandAdc == 0)
-  {
-    avgCurrA += (analogRead(PIN_CS_A) * convCS - avgCurrA) * 0.1f;
-    subBandAdc = 1;
-  }
-  else
-  {
-    avgCurrB += (analogRead(PIN_CS_B) * convCS - avgCurrB) * 0.1f;
-    subBandAdc = 0;
-  }
-  // Apply sign to measured current
-  currA = avgCurrA * polA;
-  currB = avgCurrB * polB;
-
-  // d-q currents
-  currQ =  cosf(commAngle) * currB + sinf(commAngle) * currA;
-  currD = -sinf(commAngle) * currB + cosf(commAngle) * currA;
-//  CS_A = cosf(commAngle) * d - sin(commAngle) * q 
-//  CS_B = sinf(commAngle) * d + cos(commAngle) * q 
 
   digitalWrite(PIN_LED, enableDrv);       // Debug
   digitalWriteFast(PIN_ISR_TOGGLE, LOW);  // Debug
@@ -472,12 +500,13 @@ void loop()
       break;
 
     case 3:
+      // Force rotor to one pole
       phaseA_f = 0.f;
       if ((millis() - magPoleTime) > 2000)
       {
         Serial.print("Magnetic pole found at ");
-        Serial.println(encoderAngle);
-        encoderOffset = encoderAngle;
+        Serial.println(encDeg);
+        encoderOffset = encDeg;
         demandAngle   = 0.f;
         releaseForUse = 1;
         operStep++;
@@ -491,25 +520,31 @@ void loop()
       
 //      Serial.print(" freqMeasureHz="); Serial.print(freqMeasureHz);
 //      Serial.print(" slewFreqHz=");    Serial.print(slewFreqHz);
-//      Serial.print(" CS_A=");          Serial.print(avgCurrA);
-//      Serial.print(" CS_B=");          Serial.print(avgCurrB);
+//      Serial.print(" CS_A=");          Serial.print(currAAvg);
+//      Serial.print(" CS_B=");          Serial.print(currBAvg);
 //      Serial.print(" currentMode=");   Serial.print(currentMode);
-//      Serial.print(" commAngle=");     Serial.print(commAngle);
-//      Serial.print(" polA=");          Serial.print(polA);
-//      Serial.print(" polB=");          Serial.print(polB);
+        Serial.print(" commDeg=");       Serial.print(commDeg);
+//      Serial.print(" dutyA=");         Serial.print(dutyA);
+//      Serial.print(" dutyB=");         Serial.print(dutyB);
 //      Serial.print(" currA=");         Serial.print(currA);
 //      Serial.print(" currB=");         Serial.print(currB);
-        Serial.print(" pwmGain=");       Serial.print(pwmGain);
-//      Serial.print(" encoderAngle=");  Serial.print(encoderAngle);
+        Serial.print(" dutyD=");         Serial.print(dutyD);
+        Serial.print(" dutyQ=");         Serial.print(dutyQ);
+        Serial.print(" currD=");         Serial.print(currD);
+        Serial.print(" currQ=");         Serial.print(currQ);
+//      Serial.print(" currPolA=");      Serial.print(currPolA);
+//      Serial.print(" currPolB=");      Serial.print(currPolB);
+//      Serial.print(" dutyCyc=");       Serial.print(dutyCyc);
+//      Serial.print(" encCntDiff=");    Serial.print(encCntDiff);
+//      Serial.print(" motorVel=");      Serial.print(motorVel);
+//      Serial.print(" encDeg=");        Serial.print(encDeg);
 //      Serial.print(" DemAngle=");      Serial.print(demandAngle);
 //      Serial.print(" phaseA_f=");      Serial.print(phaseA_f);
 //      Serial.print(" step8A=");        Serial.print(step8A);
 //      Serial.print(" step8B=");        Serial.print(step8B);
 //      Serial.print(" phaseAdv=");      Serial.print(phaseAdv);
-        Serial.print(" pE=");            Serial.print(pE);
-        Serial.print(" pEI=");           Serial.print(pEI);
-        Serial.print(" currD=");         Serial.print(currD);
-        Serial.print(" currQ=");         Serial.print(currQ);
+//      Serial.print(" pE=");            Serial.print(pE);
+//      Serial.print(" pEI=");           Serial.print(pEI);
 //      if (encoderIndex != pIndex) { Serial.print(" (index seen)"); pIndex = encoderIndex; } 
         Serial.println();
       
