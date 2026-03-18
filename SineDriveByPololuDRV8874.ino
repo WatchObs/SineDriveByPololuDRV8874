@@ -37,20 +37,18 @@ const int PIN_ISR_TOGGLE   = 10;  // Debug - ISR active signal
 const int PIN_RATE_PWM     = 11;  // Debug - local motor rate
 const int PIN_LED          = 13;
 
-const uint32_t RS485_BAUD = 115200;  // RS485 host comm baud rate
-
-const int BPWM_FREQ = 12000;       // PWM frequency for DRV8874 driver
+const uint32_t RS485_BAUD = 115200; // RS485 host comm baud rate
 
 // Waveform / motor geometry
+const int   BPWM_FREQ       = 25000;          // PWM frequency for DRV8874 driver
 const uint32_t uStepPerTurn = 51200;          // Microsteps per revolution
-const int   cntLUT          = 1024;           // Table entries per electrical cycle
+const float maxFreq         = uStepPerTurn*.75; // Maximum frequency (set according P/S & stepper specs)
+const float transFreqHz     = uStepPerTurn/2; // Frequency for drive mode transition
 const float magCyclesPerRev = 50.f;           // Electrical cycles per mechanical revolution
-const float phaseConv       = cntLUT / 360.f; // Convert magnetic phase angle to LUT index
 const int   PWM_BITS        = 12;             // PWM resolution
 const float PWM_MAG         = (float)(pow(2, PWM_BITS)-0); // PWM magnitude
 
-const uint32_t RATE_PWM_FREQ_HZ = uStepPerTurn*2; // FOR TESTING
-const float    transFreqHz      = uStepPerTurn/4; // Frequency for drive mode transition
+const uint32_t RATE_PWM_FREQ_HZ = uStepPerTurn*5; // FOR TESTING
 
 // ISR timing
 const uint32_t ISR_FREQ_HZ   = 25000UL;                 // ISR ticks per second
@@ -84,7 +82,7 @@ FreqMeasureMulti FreqMeasure2;          // Measure encoder phase A rate
 
 // Slew-limited output frequency for phase integration
 volatile float slewFreqHz = 0.f;        // deg/sec
-const float SLEW_RATE_HZ_PER_ISR = (float)uStepPerTurn * 2.5f / (float)ISR_FREQ_HZ;
+const float SLEW_RATE_HZ_PER_ISR = (float)uStepPerTurn * .5f / (float)ISR_FREQ_HZ;
 
 // Driver motor currents
 const    float convCS   = (3.3f/(float)pow(2,ADC_BITS)) * (1.0f/1.1f); // CS scaling: 1.1V/A
@@ -99,11 +97,13 @@ volatile float Va    = 0.f;  // Duty cycle phase A
 volatile float Vb    = 0.f;  // Duty cycle phase 
 volatile float Vd    = 0.f;  // Duty cycle D 
 volatile float Vq    = 0.f;  // Duty cycle Q
-const float    V_MAX =  1.0f;// Empirical safe max
-const float    V_MIN = -1.0f;// Empirical safe minimum
-#define MAX_CURR  1.5f       // Max current limit of motor  
-#define SUP_VOLT 15.f        // Supply voltage
+#define MAX_CURR       2.1f  // Max current limit DRV8824 (continuous)
+#define SUP_VOLT      15.f   // Supply voltage
+#define PHASE_ADV      5.f   // Phase advance per 360 deg/sec motor velocity
+#define PHASE_ADV_MAX 30.f   // Maximum permissible phase advance
 
+#define  ENC_REZ             2500    // Encoder counts per turn either phase
+#define  ENC_QUAD_REZ   (ENC_REZ * 4)// Encoder quadrature counts per turn
 Encoder motorEncoder(PIN_ENC_A, PIN_ENC_B);
 volatile long  encCnt     = 0;
 volatile int   encIndex   = -1;
@@ -116,11 +116,9 @@ volatile float magRad     = 0.f;  // Resolved magnetic angle (radians)
 volatile float slewRate   = 0.f;  // Motor slew rate deg/sec shaft angle
 volatile float motorVel   = 0.f;  // Motor velocity
 
-#define  ENC_REZ             2500    // Encoder counts per turn either phase
-#define  ENC_QUAD_REZ   (ENC_REZ * 4)// Encoder quadrature counts per turn
 
 #define limit0(A)     (((A)>1.f)    ? 1.f         : (((A)<-1.f)   ? -1.f        : (A)))
-#define limit1(A,B)   (((A)<(-B))   ? (B)         : (((A)> (B))   ?  (B)        : (A)))
+#define limit1(A,B)   (((A)<(-B))   ? (-B)        : (((A)> (B))   ?  (B)        : (A)))
 #define limit2(A,B,C) (((A)<(B))    ? (B)         : (((A)> (C))   ?  (C)        : (A)))
 #define limit180(A)   (((A)>180.f)  ? ((A)-360.f) : (((A)<-180.f) ? ((A)+360.f) : (A)))
 #define limit360(A)   (((A)>360.f)  ? ((A)-360.f) : (((A)<0.f)    ? ((A)+360.f) : (A)))
@@ -128,25 +126,11 @@ volatile float motorVel   = 0.f;  // Motor velocity
 #define hys(A,B,C)    (((A-B)>(C))?(A-C):(((A-B)<-C)?(A+C):B))
 #define sign(A)       (((A) < 0)   ? -1   : 1)
 #define signf(A)      (((A) < 0.f) ? -1.f : 1.f)
-#define SMALL         0.00000000001
-#define LARGE         (1./SMALL)
 
 void DRV8874(float val, int PIN_PH, int PIN_EN)
 {
-  val *= PWM_MAG;
-
   digitalWrite(PIN_PH, (val < 0.f) ? LOW : HIGH); // Reverse or Forward
-
-  if (fabs(val) >= PWM_MAG) 
-  {
-    pinMode(PIN_EN, OUTPUT);
-    digitalWriteFast(PIN_EN, HIGH);
-  }
-  else
-  {
-    analogWriteFrequency(PIN_EN, BPWM_FREQ);
-    analogWrite(PIN_EN, (uint16_t)fabsf(val));
-  }
+  analogWrite(PIN_EN, (uint16_t)fabsf(val * PWM_MAG));
 }
 
 void encoderIndexISR() 
@@ -208,7 +192,7 @@ void stepISR()
     long diff = encCnt - encCntP_;
     if      (diff >  (ENC_QUAD_REZ>>1)) diff -= ENC_QUAD_REZ;
     else if (diff < -(ENC_QUAD_REZ>>1)) diff += ENC_QUAD_REZ;
-    encVel2 = -diff * (360.f/ENC_QUAD_REZ) * dirVel * ISR_FREQ_HZ / encDtCnt;
+    encVel2 = -diff * (360.f/ENC_QUAD_REZ) * ISR_FREQ_HZ / encDtCnt;
     encCntP_ = encCnt;
     encDtCnt = 0;
   }
@@ -222,9 +206,7 @@ void stepISR()
       motorVel += (encVel - motorVel) * 0.02f;
   } 
   else if (micros() - lastEdgeTime > 50000) 
-  {
     motorVel = 0.f; // 50 ms without edges
-  }
   
   // d-q currents
   Id =  cosf(commRad) * Ia + sinf(commRad) * Ib;
@@ -248,6 +230,7 @@ void stepISR()
     if (fcnt) 
     {
       freqMeasureHz = (float)FreqMeasure1.countToFrequency(fsum/fcnt) * dirSign;
+      freqMeasureHz = limit1(freqMeasureHz, maxFreq); // Limit to system capability
       lastHostStepTime = millis(); // Host is alive: record activity and clear timeout
       hostTimedOut = false;
     }
@@ -266,37 +249,6 @@ void stepISR()
   demandAngle += slewRate * ISR_DT;       // deg/sec/iteration
   demandAngle  = limit360(demandAngle);   // limit to single turn
 
-  // 2) Phase integration from slew-limited rate
-  if ((fabsf(slewFreqHz) > 0.f) && releaseForUse)
-  {
-    if (fabsf(slewRate) < 20.f) // Low speed - servo on position only
-    {
-      pE   = demandAngle - encDeg;
-      pE   = limit180(pE);
-      pEI += pE * 0.0001f;
-      vE   = 0.f;
-      vEI  = 0.f;
-    }
-    else                       // High speed - servo on velocity only
-    {
-      pE   = 0.f;
-      pEI  = 0.f;
-      vE   = slewRate - motorVel;
-      vEI += vE * ISR_DT;
-    }
-    pE  = limit1(pE,  20.f);
-    vE  = limit1(vE, 500.f);
-    pEI = limit1(pEI, 50.f);
-    vEI = limit1(vEI, 50.f);
-  }
-  else
-  {
-    pE  = 0.f;
-    vE  = 0.f;
-    pEI = 0.f;
-    vEI = 0.f;
-  }
-
   // 4) Motor servo and current control
   if ((fabsf(slewFreqHz) < 1.f) && releaseForUse)
   {
@@ -305,6 +257,10 @@ void stepISR()
     digitalWriteFast(PIN_A_EN, LOW);
     pinMode(PIN_B_EN, OUTPUT);
     digitalWriteFast(PIN_B_EN, LOW);
+    pE  = 0.f;
+    vE  = 0.f;
+    pEI = 0.f;
+    vEI = 0.f;
   }
   else
   {
@@ -314,47 +270,65 @@ void stepISR()
       // Commutation mode
       if (fabsf(slewFreqHz) > transFreqHz)
       {
-        const float SERVO_KV  = 0.01f;  // Velocity error gain
-        const float SERVO_KVI = 0.01f;   // Integrated velocity error gain
+        pE   = 0.f;
+        pEI  = 0.f;
+        vE   = slewRate - motorVel;
+        vE  = limit1(vE,  500.f);
+        vEI += vE * ISR_DT;
+        vEI = limit1(vEI, 100.f);
+        demandAngle = encDeg;  // Smoother transient requirement
 
-        phaseAdv = limit1(motorVel * (15.f/(5.f*360.)), 45.f);  // Degrees phase advance (motor vel is deg/sec)
+        #define SERVO_KV   0.002f  // Velocity error gain
+        #define SERVO_KVI  0.01f   // Integrated velocity error gain
+
+        phaseAdv = motorVel * (PHASE_ADV/360.f);  // Degrees phase advance (motor vel is deg/sec)
+        phaseAdv = limit1(phaseAdv, PHASE_ADV_MAX);
         magRad   = commRad + phaseAdv * (M_PI/180.f);
 
         IqDem  = (SERVO_KV * vE + SERVO_KVI * vEI);
-        IqDem  = limit2(IqDem, -MAX_CURR, +MAX_CURR);
+        IqDem  = limit1(IqDem, 1.0f);
+//      IqDem  = limit1(IqDem, MAX_CURR);
 
         // Based on 15V, 4.8 mH, 1.13 ohms 23HS30-2804D StepperOnline nema 23
-        #define V_KP  0.1f  // Proportional voltage gain (normalized)
-        #define V_KI 15.0f  // Integral voltage gain (normalized)
+        #define V_KP  0.5f   // Proportional voltage gain (normalized)
+        #define V_KI  2.0f   // Integral voltage gain (normalized)
 
         // --- PI on Id (target = 0) ---
         vdE   = -Id;
         vdEI += V_KI * vdE * ISR_DT;
         vdEI  = limit0(vdEI);
         Vd    = V_KP * vdE + vdEI;
-        Vd    = limit2(Vd, V_MIN, V_MAX);
+        Vd    = limit0(Vd);
         
         // --- PI on Iq ---
         vqE   = IqDem - Iq;
         vqEI += V_KI * vqE * ISR_DT;
         vqEI  = limit0(vqEI);
         Vq    = V_KP * vqE + vqEI;
-        Vq    = limit2(Vq, V_MIN, V_MAX);
+        Vq    = limit0(Vq);
         
       }
       // Direct mode
       else
       {
-        const float SERVO_KP  = 0.7f; // Position error gain
-        const float SERVO_KPI = 1.0f; // Integrated position error gain
+        pE   = demandAngle - encDeg;
+        pE   = limit180(pE);
+        pE   = limit1(pE,   20.f);
+        pEI += pE * 0.0001f;
+        pEI  = limit1(pEI,  50.f);
+        vE   = 0.f;
+        vEI  = 0.f;
+
+        #define SERVO_KP  0.7f // Position error gain
+        #define SERVO_KPI 1.0f // Integrated position error gain
      
         float phase = (demandAngle + SERVO_KP * pE + SERVO_KPI * pEI) * magCyclesPerRev * (1.f/360.f);
         magRad = (phase - (int)phase) * 2.f * M_PI;  // Convert to Radians
      
-        Vd += (1.5f - fabsf(Id)) * 0.0001f; //slewFreqHz/uStepPerTurn;
+        Vd += (1.5f - fabsf(Id)) * 0.0001f;
         Vq = 0.f;
-        Vd = limit2(Vd, 0.f, V_MAX);
-        Vq = limit2(Vq, 0.f, V_MAX);
+        Vd = limit2(Vd, 0.f, 1.f);
+        Vq = limit2(Vq, 0.f, 1.f);
       }
     }
     // Initialization mode
@@ -512,17 +486,17 @@ void loop()
       uint8_t data[10] = {0};
       short Enc = (int)encCnt;
       data[0] = 0xA5;
-      data[1] = (Enc & 0xff) >> 8;
-      data[2] = (Enc & 0xff) >> 0;
+      data[1] = (Enc & 0xff00) >> 8;
+      data[2] = (Enc & 0x00ff) >> 0;
       data[3] = 0x5A;
       rs485Write((const uint8_t *)&data, 4);
       break;
   }
 
-  if ((operStep >= 4) && (millis() - lastDebugMs >= 100))
+  if ((operStep >= 4) && (millis() - lastDebugMs >= 500))
   {
-//  sTab(" freqMeasureHz=", freqMeasureHz);
-//  sTab(" slewFreqHz=",    slewFreqHz);
+    sTab(" freqMeasureHz=", freqMeasureHz);
+    sTab(" slewFreqHz=",    slewFreqHz);
 //  sTab(" commRad=",       commRad);
 //  sTab(" magRad=",        magRad);
 //  sTab(" Va=",            Va);
@@ -546,8 +520,10 @@ void loop()
 //  sTab(" encDeg=",        encDeg);
 //  sTab(" pE=",            pE);
 //  sTab(" pEI=",           pEI);
-//  sTab(" vE=",            vE);
-//  sTab(" vEI=",           vEI);
+    sTab(" vE=",            vE);
+    sTab(" vEI=",           vEI);
+    sTab(" vqE=",           vqE);
+    sTab(" vqEI=",          vqEI);
     Serial.println();
     
     lastDebugMs = millis();
