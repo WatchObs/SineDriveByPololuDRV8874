@@ -42,7 +42,7 @@ const uint32_t RS485_BAUD = 115200; // RS485 host comm baud rate
 // Waveform / motor geometry
 const int   BPWM_FREQ       = 25000;          // PWM frequency for DRV8874 driver
 const uint32_t uStepPerTurn = 51200;          // Microsteps per revolution
-const float maxFreq         = uStepPerTurn*.75; // Maximum frequency (set according P/S & stepper specs)
+const float maxFreq         = uStepPerTurn*3; // Maximum frequency (set according P/S & stepper specs)
 const float transFreqHz     = uStepPerTurn/2; // Frequency for drive mode transition
 const float magCyclesPerRev = 50.f;           // Electrical cycles per mechanical revolution
 const int   PWM_BITS        = 12;             // PWM resolution
@@ -82,7 +82,7 @@ FreqMeasureMulti FreqMeasure2;          // Measure encoder phase A rate
 
 // Slew-limited output frequency for phase integration
 volatile float slewFreqHz = 0.f;        // deg/sec
-const float SLEW_RATE_HZ_PER_ISR = (float)uStepPerTurn * .5f / (float)ISR_FREQ_HZ;
+const float SLEW_RATE_HZ_PER_ISR = (float)uStepPerTurn * 5.f / (float)ISR_FREQ_HZ;
 
 // Driver motor currents
 const    float convCS   = (3.3f/(float)pow(2,ADC_BITS)) * (1.0f/1.1f); // CS scaling: 1.1V/A
@@ -101,6 +101,14 @@ volatile float Vq    = 0.f;  // Duty cycle Q
 #define SUP_VOLT      15.f   // Supply voltage
 #define PHASE_ADV      5.f   // Phase advance per 360 deg/sec motor velocity
 #define PHASE_ADV_MAX 30.f   // Maximum permissible phase advance
+#define DIRECT_CURR   1.5f   // Direct mode target current (d axis)
+// 15V supply, 4.8 mH, 1.13 ohms, 23HS30-2804D StepperOnline nema 23
+#define V_KP          0.5f   // Proportional voltage gain (normalized)
+#define V_KI          2.0f   // Integral voltage gain (normalized)
+#define SERVO_KP      0.7f   // Position error gain
+#define SERVO_KPI     1.0f   // Integrated position error gain
+#define SERVO_KV    0.002f   // Velocity error gain
+#define SERVO_KVI    0.01f   // Integrated velocity error gain
 
 #define  ENC_REZ             2500    // Encoder counts per turn either phase
 #define  ENC_QUAD_REZ   (ENC_REZ * 4)// Encoder quadrature counts per turn
@@ -267,31 +275,53 @@ void stepISR()
     // Fade PWM levels to control current
     if (releaseForUse)   // Runtime
     {
-      // Commutation mode
-      if (fabsf(slewFreqHz) > transFreqHz)
+      static bool inFOC = false;
+
+      float absFreq = fabsf(slewFreqHz);
+      
+      // hysteresis about transFreqHz
+      const float transHi = transFreqHz * 1.2f;
+      const float transLo = transFreqHz * 0.8f;
+      
+      // decide target mode
+      bool wantFOC = (absFreq > transHi);
+      bool wantDir = (absFreq < transLo);
+      
+      // state machine for entering modes
+      if (wantFOC && !inFOC) 
       {
-        pE   = 0.f;
-        pEI  = 0.f;
+//      float Tdir = SERVO_KP * pE + SERVO_KPI * pEI;   // Direct torque
+//      vE  = slewRate - motorVel;
+//      vEI = (Tdir - SERVO_KV * vE) / SERVO_KVI;       // align torque
+//      vEI = (Iq - SERVO_KV * vE) / SERVO_KVI;
+        vEI  = (slewFreqHz > 0.f) ? abs(vEI)  : -abs(vEI);
+        vdEI = (slewFreqHz > 0.f) ? abs(vdEI) : -abs(vdEI);
+        vqEI = (slewFreqHz > 0.f) ? abs(vqEI) : -abs(vqEI);
+
+        inFOC = true;
+      }
+      else if (wantDir && inFOC) 
+      {
+        demandAngle = encDeg + Iq/DIRECT_CURR;  // Align demand
+        Vd    = .14f;
+        vEI   = (slewFreqHz > 0.f) ? abs(vEI)  : -abs(vEI);
+        inFOC = false;
+      }
+      
+      if (inFOC)  // FOC & commutation mode
+      {
+//      pEI  = 0.f;
         vE   = slewRate - motorVel;
         vE  = limit1(vE,  500.f);
         vEI += vE * ISR_DT;
         vEI = limit1(vEI, 100.f);
-        demandAngle = encDeg;  // Smoother transient requirement
-
-        #define SERVO_KV   0.002f  // Velocity error gain
-        #define SERVO_KVI  0.01f   // Integrated velocity error gain
 
         phaseAdv = motorVel * (PHASE_ADV/360.f);  // Degrees phase advance (motor vel is deg/sec)
         phaseAdv = limit1(phaseAdv, PHASE_ADV_MAX);
         magRad   = commRad + phaseAdv * (M_PI/180.f);
 
         IqDem  = (SERVO_KV * vE + SERVO_KVI * vEI);
-        IqDem  = limit1(IqDem, 1.0f);
-//      IqDem  = limit1(IqDem, MAX_CURR);
-
-        // Based on 15V, 4.8 mH, 1.13 ohms 23HS30-2804D StepperOnline nema 23
-        #define V_KP  0.5f   // Proportional voltage gain (normalized)
-        #define V_KI  2.0f   // Integral voltage gain (normalized)
+        IqDem  = limit1(IqDem, 1.0f);   // MAX_CURR);
 
         // --- PI on Id (target = 0) ---
         vdE   = -Id;
@@ -316,22 +346,20 @@ void stepISR()
         pE   = limit1(pE,   20.f);
         pEI += pE * 0.0001f;
         pEI  = limit1(pEI,  50.f);
-        vE   = 0.f;
-        vEI  = 0.f;
-
-        #define SERVO_KP  0.7f // Position error gain
-        #define SERVO_KPI 1.0f // Integrated position error gain
+//      vEI  = 0.f;
+//      vdEI = 0.f;
+//      vqEI = 0.f;
      
         float phase = (demandAngle + SERVO_KP * pE + SERVO_KPI * pEI) * magCyclesPerRev * (1.f/360.f);
         magRad = (phase - (int)phase) * 2.f * M_PI;  // Convert to Radians
      
-        Vd += (1.5f - fabsf(Id)) * 0.0001f;
+        Vd += (DIRECT_CURR - fabsf(Id)) * 0.0001f;
         Vq = 0.f;
         Vd = limit2(Vd, 0.f, 1.f);
         Vq = limit2(Vq, 0.f, 1.f);
       }
     }
-    // Initialization mode
+    // Initialization mode: index search & commutation offset (open loop)
     else
     {
       Vd = 0.15f;
@@ -493,34 +521,34 @@ void loop()
       break;
   }
 
-  if ((operStep >= 4) && (millis() - lastDebugMs >= 500))
+  if ((operStep >= 4) && (millis() - lastDebugMs >= 200))
   {
-    sTab(" freqMeasureHz=", freqMeasureHz);
+//  sTab(" freqMeasureHz=", freqMeasureHz);
     sTab(" slewFreqHz=",    slewFreqHz);
 //  sTab(" commRad=",       commRad);
 //  sTab(" magRad=",        magRad);
 //  sTab(" Va=",            Va);
 //  sTab(" Vb=",            Vb);
-//  sTab(" Vd=",            Vd);
+    sTab(" Vd=",            Vd);
     sTab(" Vq=",            Vq);
 //  sTab(" Ia=",            Ia);
 //  sTab(" Ib=",            Ib);
-//  sTab(" Id=",            Id);
+    sTab(" Id=",            Id);
     sTab(" Iq=",            Iq);
-    sTab(" IqDem=",         IqDem);
+//  sTab(" IqDem=",         IqDem);
 //  sTab(" IaPol=",         IaPol);
 //  sTab(" IbPol=",         IbPol);
 //  sTab(" slewRate=",      slewRate);
-    sTab(" encVel=",        encVel);
-    sTab(" encVel2=",       encVel2);
+//  sTab(" encVel=",        encVel);
+//  sTab(" encVel2=",       encVel2);
     sTab(" motorVel=",      motorVel);
-    sTab(" phaseAdv=",      phaseAdv);
-//  sTab(" demandAngle=",   demandAngle);
+//  sTab(" phaseAdv=",      phaseAdv);
+    sTab(" demandAngle=",   demandAngle);
 //  sTab(" encCnt=",        encCnt);
-//  sTab(" encDeg=",        encDeg);
+    sTab(" encDeg=",        encDeg);
 //  sTab(" pE=",            pE);
 //  sTab(" pEI=",           pEI);
-    sTab(" vE=",            vE);
+//  sTab(" vE=",            vE);
     sTab(" vEI=",           vEI);
     sTab(" vqE=",           vqE);
     sTab(" vqEI=",          vqEI);
