@@ -16,6 +16,9 @@ const uint32_t LOSS_TIMEOUT_MS = 500;   // adjust as needed
 volatile uint32_t lastHostStepTime = 0;
 volatile bool hostTimedOut = false;
 
+volatile float fMax = 0.f;
+volatile float fMin = 0.f;
+
 // Pins
 const int PIN_A_PH         = 5;   // Phase (direction) for winding A
 const int PIN_A_EN         = 3;   // Enable (PWM) for winding A
@@ -23,8 +26,8 @@ const int PIN_B_PH         = 4;   // Phase (direction) for winding B
 const int PIN_B_EN         = 2;   // Enable (PWM) for winding B
 const int PIN_CS_A         = 16;  // DRV8874 CS for winding A - current sensing
 const int PIN_CS_B         = 15;  // DRV8874 CS for winding B - current sensing
-const int PIN_ENC_A        = 1;   // Encoder Quadrature A
-const int PIN_ENC_B        = 0;   // Encoder Quadrature B
+const int PIN_ENC_A        = 0;   // Encoder Quadrature A
+const int PIN_ENC_B        = 1;   // Encoder Quadrature B
 const int PIN_ENC_IDX      = 12;  // Encoder Index (Z)
 const int PIN_ENC_RATE     = 23;  // Measure encoder pulse rate (phase A) - pairs with 22
 const int PIN_HOST_ENABLE  = 20;  // Host motor enable DIP
@@ -44,9 +47,9 @@ const int   BPWM_FREQ       = 25000;          // PWM frequency for DRV8874 drive
 const uint32_t uStepPerTurn = 51200;          // Microsteps per revolution
 const float maxFreq         = uStepPerTurn*3; // Maximum frequency (set according P/S & stepper specs)
 const float transFreqHz     = uStepPerTurn/2; // Frequency for drive mode transition
-const float magCyclesPerRev = 50.f;           // Electrical cycles per mechanical revolution
 const int   PWM_BITS        = 12;             // PWM resolution
 const float PWM_MAG         = (float)(pow(2, PWM_BITS)-0); // PWM magnitude
+#define MAG_CYCLES_PER_REV  50.f              // Electrical cycles per mechanical revolution
 
 const uint32_t RATE_PWM_FREQ_HZ = uStepPerTurn*5; // FOR TESTING
 
@@ -105,7 +108,7 @@ volatile float Vq    = 0.f;  // Duty cycle Q
 // 15V supply, 4.8 mH, 1.13 ohms, 23HS30-2804D StepperOnline nema 23
 #define V_KP          0.5f   // Proportional voltage gain (normalized)
 #define V_KI          2.0f   // Integral voltage gain (normalized)
-#define SERVO_KP      0.7f   // Position error gain
+#define SERVO_KP      2.0f   // Position error gain
 #define SERVO_KPI     1.0f   // Integrated position error gain
 #define SERVO_KV    0.002f   // Velocity error gain
 #define SERVO_KVI    0.01f   // Integrated velocity error gain
@@ -113,17 +116,20 @@ volatile float Vq    = 0.f;  // Duty cycle Q
 #define  ENC_REZ             2500    // Encoder counts per turn either phase
 #define  ENC_QUAD_REZ   (ENC_REZ * 4)// Encoder quadrature counts per turn
 Encoder motorEncoder(PIN_ENC_A, PIN_ENC_B);
-volatile long  encCnt     = 0;
-volatile int   encIndex   = -1;
-volatile float encDeg     = 0.f;
+volatile long  encCnt     = 0;    // Encoder quadrature counts
+volatile int   encIndex   = -1;   // Encoder index detection count
+volatile float encDeg     = 0.f;  // Encoder shaft angle in degrees
 volatile float encOffset  = 0.f;  // Encoder offset (to magnetic cycle)
 volatile float encVel     = 0.f;  // Encoder computed velocity from phase A period
 volatile float encVel2    = 0.f;  // Encoder computed velocity from encoder counts
+volatile float commNrm    = 0.f;  // Commutation angle (normalized)
 volatile float commRad    = 0.f;  // Commutation angle (radians)
 volatile float magRad     = 0.f;  // Resolved magnetic angle (radians)
 volatile float slewRate   = 0.f;  // Motor slew rate deg/sec shaft angle
 volatile float motorVel   = 0.f;  // Motor velocity
-
+#define PH_CORR_CNT  (int)(ENC_QUAD_REZ/MAG_CYCLES_PER_REV) // Phase correction LUT elements
+//#define PH_CORR_CNT  ENC_QUAD_REZ // Phase correction LUT elements
+volatile float phCorrLUT[PH_CORR_CNT] = {0.f};  // Phase correction in direct mode trained LUT
 
 #define limit0(A)     (((A)>1.f)    ? 1.f         : (((A)<-1.f)   ? -1.f        : (A)))
 #define limit1(A,B)   (((A)<(-B))   ? (-B)        : (((A)> (B))   ?  (B)        : (A)))
@@ -162,10 +168,15 @@ void stepISR()
   Ib += (analogRead(PIN_CS_B) * convCS * IbPol - Ib) * 0.1f;
 
   // Encoder feedback, motor shaft position, magnetic angle
-  encCnt  = motorEncoder.read() % ENC_QUAD_REZ;
-  encDeg  = -(float)encCnt * (360.0f / (float)ENC_QUAD_REZ) - encOffset;
-  float temp = encDeg * magCyclesPerRev * (1.f/360.f);
-  commRad = (temp - (int)temp) * 2 * M_PI;
+  encCnt = motorEncoder.read() % ENC_QUAD_REZ;
+  if (encCnt < 0) encCnt += ENC_QUAD_REZ;
+  encDeg  = (float)encCnt * (360.0f / (float)ENC_QUAD_REZ) - encOffset;
+  encDeg = limit360(encDeg);
+  float temp = encDeg * MAG_CYCLES_PER_REV * (1.f/360.f);
+//commNrm = temp - (int)temp;  // Commutation magnetic cycle normalized
+//if (commNrm < 0.f) commNrm += 1.f;
+  commNrm = temp - floorf(temp);   // Always yields [0,1)
+  commRad = commNrm * 2 * M_PI;
  
   // Encoder pulse period - velocity
   int fcnt = 0;
@@ -179,43 +190,48 @@ void stepISR()
   }
 
   static float dirVel = 1.f;
-  static long encCntP = 0;
+  static long  encCntP = 0;
 
   if (encCntP != encCnt)
   {
     long diff = encCnt - encCntP;
     if      (diff >  (ENC_QUAD_REZ>>1)) diff -= ENC_QUAD_REZ;
     else if (diff < -(ENC_QUAD_REZ>>1)) diff += ENC_QUAD_REZ;
-    dirVel = -(float)sign(diff);
+    dirVel =  (float)sign(diff);
     encCntP = encCnt;
   }
 
   static int encDtCnt = 0;
 
   encDtCnt++;
-  if (encDtCnt > 10)
+  if (encDtCnt > 100)
   {
     static long encCntP_ = 0;
 
     long diff = encCnt - encCntP_;
     if      (diff >  (ENC_QUAD_REZ>>1)) diff -= ENC_QUAD_REZ;
     else if (diff < -(ENC_QUAD_REZ>>1)) diff += ENC_QUAD_REZ;
-    encVel2 = -diff * (360.f/ENC_QUAD_REZ) * ISR_FREQ_HZ / encDtCnt;
+    encVel2 =  diff * (360.f/ENC_QUAD_REZ) * ISR_FREQ_HZ / encDtCnt;
     encCntP_ = encCnt;
     encDtCnt = 0;
   }
 
   if (fcnt)
   {
-    encVel    = FreqMeasure2.countToFrequency(fsum/fcnt) * (360.f / ENC_REZ) * dirVel;
-    if (fabsf(encVel - encVel2) > (encVel2 * .1f))  // non sense encoder phase A derived velocity?
-      motorVel += (encVel2 - motorVel) * 0.02f;
-    else
+    encVel = FreqMeasure2.countToFrequency(fsum/fcnt) * (360.f / ENC_REZ) * dirVel;
+    if (fabsf(slewRate - (float)encVel) < (slewRate * .1f))
       motorVel += (encVel - motorVel) * 0.02f;
+    else
+      motorVel += (encVel2 - motorVel) * 0.02f;
   } 
-  else if (micros() - lastEdgeTime > 50000) 
-    motorVel = 0.f; // 50 ms without edges
-  
+  else if (micros() - lastEdgeTime > 100000) // 100 ms without edges
+  { 
+    motorVel = 0.f;
+    encVel   = 0.f;
+    encVel2  = 0.f;
+  }
+//// motorVel = motorVel * 0.98f + encVel * 0.02f;  maybe, AI suggssted
+
   // d-q currents
   Id =  cosf(commRad) * Ia + sinf(commRad) * Ib;
   Iq = -sinf(commRad) * Ia + cosf(commRad) * Ib;
@@ -224,11 +240,11 @@ void stepISR()
   if (releaseForUse)
   {
     // 1) Sample host step frequency, direction and enable
-    enableDrv = digitalReadFast(PIN_HOST_ENABLE) ? LOW : HIGH;
+    enableDrv = digitalReadFast(PIN_HOST_ENABLE) ? HIGH : LOW;
     dirSign   = digitalReadFast(PIN_HOST_DIR   ) ? 1.f : -1.f;
    
-    int fcnt = 0;
-    uint32_t fsum = 0;
+    fcnt = 0;
+    fsum = 0;
     while (FreqMeasure1.available())
     {
       fcnt++;
@@ -243,6 +259,11 @@ void stepISR()
       hostTimedOut = false;
     }
    
+    if (freqMeasureHz > fMax) fMax = freqMeasureHz;
+    if (freqMeasureHz < fMin) fMin = freqMeasureHz;
+    fMax += (freqMeasureHz - fMax) * 0.0001;
+    fMin += (freqMeasureHz - fMin) * 0.0001; 
+
     // --- Host timeout-aware target frequency ---
     if (hostTimedOut || (enableDrv == LOW)) freqMeasureHz = 0.0f; // Force a controlled ramp-down
    
@@ -272,7 +293,6 @@ void stepISR()
   }
   else
   {
-    // Fade PWM levels to control current
     if (releaseForUse)   // Runtime
     {
       static bool inFOC = false;
@@ -283,12 +303,8 @@ void stepISR()
       const float transHi = transFreqHz * 1.2f;
       const float transLo = transFreqHz * 0.8f;
       
-      // decide target mode
-      bool wantFOC = (absFreq > transHi);
-      bool wantDir = (absFreq < transLo);
-      
-      // state machine for entering modes
-      if (wantFOC && !inFOC) 
+      // FOC <> Direct transitions
+      if ((absFreq > transHi) && !inFOC) 
       {
 //      float Tdir = SERVO_KP * pE + SERVO_KPI * pEI;   // Direct torque
 //      vE  = slewRate - motorVel;
@@ -300,7 +316,7 @@ void stepISR()
 
         inFOC = true;
       }
-      else if (wantDir && inFOC) 
+      else if ((absFreq < transLo) && inFOC) 
       {
         demandAngle = encDeg + Iq/DIRECT_CURR;  // Align demand
         Vd    = .14f;
@@ -343,20 +359,33 @@ void stepISR()
       {
         pE   = demandAngle - encDeg;
         pE   = limit180(pE);
-        pE   = limit1(pE,   20.f);
+        pE   = limit1(pE, 1.f);
         pEI += pE * 0.0001f;
-        pEI  = limit1(pEI,  50.f);
-//      vEI  = 0.f;
-//      vdEI = 0.f;
-//      vqEI = 0.f;
+        pEI  = limit1(pEI, 2.f);
      
-        float phase = (demandAngle + SERVO_KP * pE + SERVO_KPI * pEI) * magCyclesPerRev * (1.f/360.f);
-        magRad = (phase - (int)phase) * 2.f * M_PI;  // Convert to Radians
+        int   phCorrIndex = (int)(commNrm * (float)PH_CORR_CNT);
+        phCorrIndex = limit2(phCorrIndex, 0, (PH_CORR_CNT-1));
+//      int phCorrIndex = limit2(encCnt, 0, (ENC_QUAD_REZ-1));  // To be safe!
+        float phaseCorr = SERVO_KP * pE + SERVO_KPI * pEI;
+//      phaseCorr = limit1(phaseCorr, 1.f);
+//      float phase = (demandAngle + phaseCorr + 0.f * phCorrLUT[phCorrIndex] * signf(slewRate)) * MAG_CYCLES_PER_REV * (1.f/360.f);
+//      phase = (phase - (int)phase);  // Extract single turn normalized
+        float phase = (demandAngle + phaseCorr) * MAG_CYCLES_PER_REV * (1.f/360.f);
+        phase = phase - floorf(phase); 
+//      phase = fmodf(phase, 1.0f);
+//      if (phase < 0.f) phase += 1.0f;
+        magRad = phase * 2.f * M_PI;   // Convert to Radians
+        // Training
+        if ((fabsf(slewRate - 360.f/240.f) < .5f) && 0) // Only aggregate when near sidereal
+        {
+          phCorrLUT[phCorrIndex] += phaseCorr * ISR_DT * 50.f;
+          phCorrLUT[phCorrIndex]  = limit1(phCorrLUT[phCorrIndex], 0.5f);
+        }
      
         Vd += (DIRECT_CURR - fabsf(Id)) * 0.0001f;
-        Vq = 0.f;
-        Vd = limit2(Vd, 0.f, 1.f);
-        Vq = limit2(Vq, 0.f, 1.f);
+        Vq  = 0.f;
+        Vd  = limit2(Vd, 0.f, 1.f);
+        Vq  = limit2(Vq, 0.f, 1.f);
       }
     }
     // Initialization mode: index search & commutation offset (open loop)
@@ -364,7 +393,7 @@ void stepISR()
     {
       Vd = 0.15f;
       Vq = 0.f;
-      float phase = demandAngle * magCyclesPerRev * (1.f/360.f);
+      float phase = demandAngle * MAG_CYCLES_PER_REV * (1.f/360.f);
       magRad = (phase - (int)phase) *  2.f * M_PI;  // Convert to Radians
     }
 
@@ -426,8 +455,6 @@ void setup()
   // RS485 comm (Rx2/TX2)
   Serial2.begin(RS485_BAUD);
   Serial2.transmitterEnable(PIN_DE_RE);
-//pinMode(PIN_DE_RE, OUTPUT);
-//digitalWrite(PIN_DE_RE, LOW);   // Receive mode
 
   // start ISR timer
   stepTimer.begin(stepISR, ISR_PERIOD_US);
@@ -436,10 +463,8 @@ void setup()
 // Transmit with DE/RE control
 void rs485Write(const uint8_t *data, size_t len) 
 {
-//digitalWrite(PIN_DE_RE, HIGH);   // Enable TX
   Serial2.write(data, len);
   Serial2.flush();                 // Wait for TX to finish
-//digitalWrite(PIN_DE_RE, LOW);    // Back to RX
 }
 
 // Non‑blocking receive
@@ -466,6 +491,7 @@ void loop()
   static int      operStep    = 0;
   static uint32_t magPoleTime = 0;
   static uint32_t lastDebugMs = 0;
+  static uint32_t lastDebugMs2 = 0;
 
   switch (operStep)
   {
@@ -512,49 +538,66 @@ void loop()
     case 4:
       // Send shaft position to host (no Rx expected)
       uint8_t data[10] = {0};
-      short Enc = (int)encCnt;
-      data[0] = 0xA5;
-      data[1] = (Enc & 0xff00) >> 8;
-      data[2] = (Enc & 0x00ff) >> 0;
-      data[3] = 0x5A;
+      short Enc = -(int)((float)(encCnt * 0x3fff) / ENC_QUAD_REZ);  // Convert to match Servo57D 14 bits
+      data[0] = 0x10 | ((Enc>>12) & 0xf);  // MSB
+      data[1] = 0x20 | ((Enc>> 8) & 0xf);
+      data[2] = 0x30 | ((Enc>> 4) & 0xf);
+      data[3] = 0x40 | ((Enc>> 0) & 0xf);  // LSB
       rs485Write((const uint8_t *)&data, 4);
       break;
   }
 
-  if ((operStep >= 4) && (millis() - lastDebugMs >= 200))
+  if ((operStep >= 4) && (millis() - lastDebugMs >= 100))
   {
-//  sTab(" freqMeasureHz=", freqMeasureHz);
-    sTab(" slewFreqHz=",    slewFreqHz);
+//  sTab(" enableDrv=",     enableDrv);
+//  sTab(" dirSign=",       dirSign);
+    sTab(" freqMeasureHz=", freqMeasureHz);
+//  sTab(" fMax=",          fMax);
+//  sTab(" fMin=",          fMin);
+//  sTab(" slewFreqHz=",    slewFreqHz);
 //  sTab(" commRad=",       commRad);
 //  sTab(" magRad=",        magRad);
 //  sTab(" Va=",            Va);
 //  sTab(" Vb=",            Vb);
-    sTab(" Vd=",            Vd);
-    sTab(" Vq=",            Vq);
+//  sTab(" Vd=",            Vd);
+//  sTab(" Vq=",            Vq);
 //  sTab(" Ia=",            Ia);
 //  sTab(" Ib=",            Ib);
-    sTab(" Id=",            Id);
-    sTab(" Iq=",            Iq);
+//  sTab(" Id=",            Id);
+//  sTab(" Iq=",            Iq);
 //  sTab(" IqDem=",         IqDem);
 //  sTab(" IaPol=",         IaPol);
 //  sTab(" IbPol=",         IbPol);
-//  sTab(" slewRate=",      slewRate);
+    sTab(" slewRate=",      slewRate);
 //  sTab(" encVel=",        encVel);
 //  sTab(" encVel2=",       encVel2);
-    sTab(" motorVel=",      motorVel);
-//  sTab(" phaseAdv=",      phaseAdv);
+//  sTab(" motorVel=",      motorVel);
+    sTab(" encCnt=",        encCnt);
     sTab(" demandAngle=",   demandAngle);
-//  sTab(" encCnt=",        encCnt);
     sTab(" encDeg=",        encDeg);
-//  sTab(" pE=",            pE);
-//  sTab(" pEI=",           pEI);
+//  sTab(" phaseAdv=",      phaseAdv);
+    sTab(" pE=",            pE);
+    sTab(" pEI=",           pEI);
 //  sTab(" vE=",            vE);
-    sTab(" vEI=",           vEI);
-    sTab(" vqE=",           vqE);
-    sTab(" vqEI=",          vqEI);
+//  sTab(" vEI=",           vEI);
+//  sTab(" vqE=",           vqE);
+//  sTab(" vqEI=",          vqEI);
+
     Serial.println();
-    
+
     lastDebugMs = millis();
+  }
+
+  if ((operStep >= 4) && (millis() - lastDebugMs2 >= 10000) && 0)
+  {
+//  for (int i=0; i<PH_CORR_CNT; i++)
+    for (int i=0; i<30; i++)
+    {
+      Serial.print(phCorrLUT[i]);
+      Serial.print(" ");
+    }
+    Serial.println();
+    lastDebugMs2 = millis();
   }
 
   // --- Host step loss detection ---
