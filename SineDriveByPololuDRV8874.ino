@@ -263,11 +263,6 @@ if (isrCount > (int)ISR_FREQ_HZ) isrCount = 0;
       hostTimedOut = false;
     }
    
-    if (freqMeasureHz > fMax) fMax = freqMeasureHz;
-    if (freqMeasureHz < fMin) fMin = freqMeasureHz;
-    fMax += (freqMeasureHz - fMax) * 0.0001;
-    fMin += (freqMeasureHz - fMin) * 0.0001; 
-
     // --- Host timeout-aware target frequency ---
     if (hostTimedOut || (enableDrv == LOW)) freqMeasureHz = 0.0f; // Force a controlled ramp-down
    
@@ -276,7 +271,7 @@ if (isrCount > (int)ISR_FREQ_HZ) isrCount = 0;
     float deltaLim = 0;
 
     if (fabsf(slewFreqHz) < 500.f) 
-      deltaLim = 40.f;
+      deltaLim = 5000.f/(float)ISR_FREQ_HZ;
     else
       deltaLim = SLEW_RATE_HZ_PER_ISR;
 
@@ -284,6 +279,11 @@ if (isrCount > (int)ISR_FREQ_HZ) isrCount = 0;
     else if (freqDelta < -deltaLim) slewFreqHz -= deltaLim;
     else                            slewFreqHz  = freqMeasureHz;
   }  // releaseForUse
+
+  if (slewFreqHz > fMax) fMax = slewFreqHz;
+  if (slewFreqHz < fMin) fMin = slewFreqHz;
+  fMax += (slewFreqHz - fMax) * 0.0001;
+  fMin += (slewFreqHz - fMin) * 0.0001; 
 
   slewRate     = slewFreqHz * rateToDeg;            // degrees/sec
   demandAngle += (double)slewRate * (double)ISR_DT; // deg/sec/iteration
@@ -557,14 +557,14 @@ void loop()
       break;
   }
 
-  if ((operStep >= 4) && (millis() - lastDebugMs >= 100) && 1)
+  if ((operStep >= 4) && (millis() - lastDebugMs >= 500) && 1)
   {
 //  sTab(" isrCount=",      isrCount);
 //  sTab(" enableDrv=",     enableDrv);
 //  sTab(" dirSign=",       dirSign);
     sTab(" freqMeasureHz=", freqMeasureHz);
-//  sTab(" fMax=",          fMax);
-//  sTab(" fMin=",          fMin);
+    sTab(" fMax=",          fMax);
+    sTab(" fMin=",          fMin);
     sTab(" slewFreqHz=",    slewFreqHz);
 //  sTab(" commRad=",       commRad);
 //  sTab(" magRad=",        magRad);
