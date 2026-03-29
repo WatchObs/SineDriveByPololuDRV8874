@@ -32,7 +32,7 @@ const int PIN_ENC_IDX      = 12;  // Encoder Index (Z)
 const int PIN_ENC_RATE     = 23;  // Measure encoder pulse rate (phase A) - pairs with 22
 const int PIN_HOST_ENABLE  = 20;  // Host motor enable DIP
 const int PIN_HOST_DIR     = 21;  // Host motor direction DIP
-const int PIN_HOST_FREQMSR = 22;  // Host requested rate (freq) used by FreqMeasure1 API - pairs with 23
+const int PIN_HOST_RATE    = 22;  // Host requested rate (freq) - pairs with 23
 const int PIN_RX2          = 7;   // RS485 receive comm with host
 const int PIN_TX2          = 8;   // RS485 transmit comm with host
 const int PIN_DE_RE        = 6;   // RS485 bus enable
@@ -65,7 +65,7 @@ const float rateToDeg  = 360.f/(float)uStepPerTurn;
 const int ADC_BITS = 12;
 
 // --- Shared state (volatile for ISR/main) ---
-volatile float  demandAngle   = 0.0f;   // Demanded shaft angle (degrees)
+volatile double demandAngle   = 0.0f;   // Demanded shaft angle (degrees) fine resolution due to ISR dt integration at low slew rates
 volatile float  phaseAdv      = 0.0f;   // Phase advance
 volatile float  pE            = 0.0f;   // Position error
 volatile float  pEI           = 0.0f;   // Position error integration
@@ -79,6 +79,8 @@ volatile float  dirSign       = 1;      // +1 CW, -1 CCW
 volatile int8_t enableDrv     = HIGH;   // Drive enable
 volatile int    releaseForUse = 0;      // Stepper released for normal drive
 volatile float  freqMeasureHz = 0.f;    // Host step frequency
+
+volatile int   isrCount = 0;
 
 FreqMeasureMulti FreqMeasure1;           // Measure host step rate
 FreqMeasureMulti FreqMeasure2;          // Measure encoder phase A rate
@@ -131,11 +133,12 @@ volatile float motorVel   = 0.f;  // Motor velocity
 //#define PH_CORR_CNT  ENC_QUAD_REZ // Phase correction LUT elements
 volatile float phCorrLUT[PH_CORR_CNT] = {0.f};  // Phase correction in direct mode trained LUT
 
-#define limit0(A)     (((A)>1.f)    ? 1.f         : (((A)<-1.f)   ? -1.f        : (A)))
-#define limit1(A,B)   (((A)<(-B))   ? (-B)        : (((A)> (B))   ?  (B)        : (A)))
-#define limit2(A,B,C) (((A)<(B))    ? (B)         : (((A)> (C))   ?  (C)        : (A)))
-#define limit180(A)   (((A)>180.f)  ? ((A)-360.f) : (((A)<-180.f) ? ((A)+360.f) : (A)))
-#define limit360(A)   (((A)>360.f)  ? ((A)-360.f) : (((A)<0.f)    ? ((A)+360.f) : (A)))
+#define limit0(A)     (((A)>1.f)   ? 1.f         : (((A)<-1.f)   ? -1.f        : (A)))
+#define limit1(A,B)   (((A)<(-B))  ? (-B)        : (((A)> (B))   ?  (B)        : (A)))
+#define limit2(A,B,C) (((A)<(B))   ? (B)         : (((A)> (C))   ?  (C)        : (A)))
+#define limit180(A)   (((A)>180.f) ? ((A)-360.f) : (((A)<-180.f) ? ((A)+360.f) : (A)))
+#define limit360(A)   (((A)>360.f) ? ((A)-360.f) : (((A)<0.f)    ? ((A)+360.f) : (A)))
+#define limit360D(A)  (((A)>360.)  ? ((A)-360.)  : (((A)<0.)     ? ((A)+360.)  : (A)))
 #define db(A,B)       (((A)>(B))?((A)-(B)):(((A)<-(B))?((A)+(B)):0))
 #define hys(A,B,C)    (((A-B)>(C))?(A-C):(((A-B)<-C)?(A+C):B))
 #define sign(A)       (((A) < 0)   ? -1   : 1)
@@ -158,7 +161,8 @@ void encoderIndexISR()
 void stepISR()
 {
   digitalWriteFast(PIN_ISR_TOGGLE, HIGH);  // Debug
-
+isrCount++;
+if (isrCount > (int)ISR_FREQ_HZ) isrCount = 0;
   // Motor currents
   float angle = atan2f(Vb, Va);   // electrical angle of voltage vector
   IaPol = (cosf(angle) < 0.f) ? -1.f : 1.f;
@@ -269,14 +273,21 @@ void stepISR()
    
     // Slew output frequency toward input frequency
     float freqDelta = freqMeasureHz - slewFreqHz;
-    if      (freqDelta >  SLEW_RATE_HZ_PER_ISR) slewFreqHz += SLEW_RATE_HZ_PER_ISR;
-    else if (freqDelta < -SLEW_RATE_HZ_PER_ISR) slewFreqHz -= SLEW_RATE_HZ_PER_ISR;
-    else                                        slewFreqHz  = freqMeasureHz;
+    float deltaLim = 0;
+
+    if (fabsf(slewFreqHz) < 500.f) 
+      deltaLim = 40.f;
+    else
+      deltaLim = SLEW_RATE_HZ_PER_ISR;
+
+    if      (freqDelta >  deltaLim) slewFreqHz += deltaLim;
+    else if (freqDelta < -deltaLim) slewFreqHz -= deltaLim;
+    else                            slewFreqHz  = freqMeasureHz;
   }  // releaseForUse
 
-  slewRate     = slewFreqHz * rateToDeg;  // degrees/sec
-  demandAngle += slewRate * ISR_DT;       // deg/sec/iteration
-  demandAngle  = limit360(demandAngle);   // limit to single turn
+  slewRate     = slewFreqHz * rateToDeg;            // degrees/sec
+  demandAngle += (double)slewRate * (double)ISR_DT; // deg/sec/iteration
+  demandAngle  = limit360D(demandAngle);            // limit to single turn
 
   // 4) Motor servo and current control
   if ((fabsf(slewFreqHz) < 1.f) && releaseForUse)
@@ -318,7 +329,7 @@ void stepISR()
       }
       else if ((absFreq < transLo) && inFOC) 
       {
-        demandAngle = encDeg + Iq/DIRECT_CURR;  // Align demand
+        demandAngle = (double)(encDeg + Iq/DIRECT_CURR);  // Align demand
         Vd    = .14f;
         vEI   = (slewFreqHz > 0.f) ? abs(vEI)  : -abs(vEI);
         inFOC = false;
@@ -357,30 +368,29 @@ void stepISR()
       // Direct mode
       else
       {
-        pE   = demandAngle - encDeg;
+        pE   = (float)demandAngle - encDeg;
         pE   = limit180(pE);
         pE   = limit1(pE, 1.f);
         pEI += pE * 0.0001f;
         pEI  = limit1(pEI, 2.f);
      
-        int   phCorrIndex = (int)(commNrm * (float)PH_CORR_CNT);
-        phCorrIndex = limit2(phCorrIndex, 0, (PH_CORR_CNT-1));
+//      int   phCorrIndex = (int)(commNrm * (float)PH_CORR_CNT);
+//      phCorrIndex = limit2(phCorrIndex, 0, (PH_CORR_CNT-1));
 //      int phCorrIndex = limit2(encCnt, 0, (ENC_QUAD_REZ-1));  // To be safe!
         float phaseCorr = SERVO_KP * pE + SERVO_KPI * pEI;
 //      phaseCorr = limit1(phaseCorr, 1.f);
-//      float phase = (demandAngle + phaseCorr + 0.f * phCorrLUT[phCorrIndex] * signf(slewRate)) * MAG_CYCLES_PER_REV * (1.f/360.f);
-//      phase = (phase - (int)phase);  // Extract single turn normalized
-        float phase = (demandAngle + phaseCorr) * MAG_CYCLES_PER_REV * (1.f/360.f);
+//      float phase = ((float)demandAngle + phaseCorr + phCorrLUT[phCorrIndex] * signf(slewRate)) * MAG_CYCLES_PER_REV * (1.f/360.f);
+        float phase = ((float)demandAngle + phaseCorr) * MAG_CYCLES_PER_REV * (1.f/360.f);
         phase = phase - floorf(phase); 
 //      phase = fmodf(phase, 1.0f);
 //      if (phase < 0.f) phase += 1.0f;
         magRad = phase * 2.f * M_PI;   // Convert to Radians
         // Training
-        if ((fabsf(slewRate - 360.f/240.f) < .5f) && 0) // Only aggregate when near sidereal
-        {
-          phCorrLUT[phCorrIndex] += phaseCorr * ISR_DT * 50.f;
-          phCorrLUT[phCorrIndex]  = limit1(phCorrLUT[phCorrIndex], 0.5f);
-        }
+//      if ((fabsf(slewRate - 360.f/240.f) < .5f) && 0) // Only aggregate when near sidereal
+//      {
+//        phCorrLUT[phCorrIndex] += phaseCorr * ISR_DT * 50.f;
+//        phCorrLUT[phCorrIndex]  = limit1(phCorrLUT[phCorrIndex], 0.5f);
+//      }
      
         Vd += (DIRECT_CURR - fabsf(Id)) * 0.0001f;
         Vq  = 0.f;
@@ -393,7 +403,7 @@ void stepISR()
     {
       Vd = 0.15f;
       Vq = 0.f;
-      float phase = demandAngle * MAG_CYCLES_PER_REV * (1.f/360.f);
+      float phase = (float)demandAngle * MAG_CYCLES_PER_REV * (1.f/360.f);
       magRad = (phase - (int)phase) *  2.f * M_PI;  // Convert to Radians
     }
 
@@ -449,7 +459,7 @@ void setup()
   analogReadAveraging(1);  // No averaging to speed up
 
   // Setup frequency counter/measure
-  FreqMeasure1.begin(PIN_HOST_FREQMSR);
+  FreqMeasure1.begin(PIN_HOST_RATE);
   FreqMeasure2.begin(PIN_ENC_RATE);
 
   // RS485 comm (Rx2/TX2)
@@ -523,13 +533,13 @@ void loop()
 
     case 3:
       // Force rotor to one pole
-      demandAngle = 0.f;
+      demandAngle = 0.;
       if ((millis() - magPoleTime) > 2000)
       {
         Serial.print("Magnetic pole found at ");
         Serial.println(encDeg);
         encOffset     = encDeg;
-        demandAngle   = 0.f;
+        demandAngle   = 0.;
         releaseForUse = 1;
         operStep++;
       }
@@ -547,14 +557,15 @@ void loop()
       break;
   }
 
-  if ((operStep >= 4) && (millis() - lastDebugMs >= 100))
+  if ((operStep >= 4) && (millis() - lastDebugMs >= 100) && 1)
   {
+//  sTab(" isrCount=",      isrCount);
 //  sTab(" enableDrv=",     enableDrv);
 //  sTab(" dirSign=",       dirSign);
     sTab(" freqMeasureHz=", freqMeasureHz);
 //  sTab(" fMax=",          fMax);
 //  sTab(" fMin=",          fMin);
-//  sTab(" slewFreqHz=",    slewFreqHz);
+    sTab(" slewFreqHz=",    slewFreqHz);
 //  sTab(" commRad=",       commRad);
 //  sTab(" magRad=",        magRad);
 //  sTab(" Va=",            Va);
