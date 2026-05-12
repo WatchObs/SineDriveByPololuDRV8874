@@ -1,0 +1,70 @@
+(footprint "Untitled"
+	(version 20260206)
+	(generator "pcbnew")
+	(generator_version "10.0")
+	(layer "F.Cu")
+	(property "Reference" "AS5047D"
+		(at -18.735058 -12.640941 0)
+		(unlocked yes)
+		(layer "F.SilkS")
+		(uuid "37537e8f-2817-41a2-add7-e13c0ef74f60")
+		(effects
+			(font
+				(size 1 1)
+				(thickness 0.1)
+			)
+		)
+	)
+	(property "Value" "AS5047D"
+		(at -19.536 -8.496941 0)
+		(unlocked yes)
+		(layer "F.Fab")
+		(uuid "36c1e5bf-8a59-4704-a4d4-c7ad8c88445b")
+		(effects
+			(font
+				(size 1 1)
+				(thickness 0.15)
+			)
+		)
+	)
+	(property "Datasheet" ""
+		(at 0 0 0)
+		(unlocked yes)
+		(layer "F.Fab")
+		(hide yes)
+		(uuid "6f1838b5-de42-400c-880e-ee93e1684785")
+		(effects
+			(font
+				(size 1 1)
+				(thickness 0.15)
+			)
+		)
+	)
+	(property "Description" ""
+		(at 0 0 0)
+		(unlocked yes)
+		(layer "F.Fab")
+		(hide yes)
+		(uuid "55a8c91e-4f1c-4356-8a66-04aa492a9740")
+		(effects
+			(font
+				(size 1 1)
+				(thickness 0.15)
+			)
+		)
+	)
+	(attr board_only exclude_from_pos_files exclude_from_bom)
+	(duplicate_pad_numbers_are_jumpers no)
+	(fp_rect
+		(start -11 -13.83)
+		(end 11 13.83)
+		(stroke
+			(width 0.1)
+			(type solid)
+		)
+		(fill no)
+		(layer "F.Fab")
+		(uuid "9e588d4a-7477-4370-8ab3-7699d8251627")
+	)
+	(embedded_fonts no)
+)
