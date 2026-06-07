@@ -1,0 +1,61 @@
+** Drc report for TeensyIOController.kicad_pcb **
+** Created on 2026-04-28T19:01:32 **
+** Report includes: Errors, Warnings **
+
+** Found 12 DRC violations **
+[lib_footprint_mismatch]: Footprint 'TMC2008' does not match copy in library 'OEM'
+    Local override; warning
+    @(114.3000 mm, 99.0600 mm): Footprint A6
+[lib_footprint_mismatch]: Footprint 'C_Disc_D5.0mm_W2.5mm_P5.00mm' does not match copy in library 'Capacitor_THT'
+    Local override; warning
+    @(200.8900 mm, 113.7800 mm): Footprint C3
+[lib_footprint_mismatch]: Footprint 'R_Axial_DIN0207_L6.3mm_D2.5mm_P2.54mm_Vertical' does not match copy in library 'Resistor_THT'
+    Local override; warning
+    @(148.5900 mm, 87.6300 mm): Footprint JP1
+[lib_footprint_mismatch]: Footprint 'R_Axial_DIN0207_L6.3mm_D2.5mm_P2.54mm_Vertical' does not match copy in library 'Resistor_THT'
+    Local override; warning
+    @(154.8900 mm, 123.9900 mm): Footprint R3
+[lib_footprint_mismatch]: Footprint 'C_Disc_D5.0mm_W2.5mm_P5.00mm' does not match copy in library 'Capacitor_THT'
+    Local override; warning
+    @(210.8900 mm, 113.7800 mm): Footprint C4
+[lib_footprint_mismatch]: Footprint 'R_Axial_DIN0207_L6.3mm_D2.5mm_P2.54mm_Vertical' does not match copy in library 'Resistor_THT'
+    Local override; warning
+    @(101.1500 mm, 124.4600 mm): Footprint R1
+[lib_footprint_mismatch]: Footprint 'CP_Radial_D8.0mm_P2.50mm' does not match copy in library 'Capacitor_THT'
+    Local override; warning
+    @(200.8947 mm, 121.9200 mm): Footprint C1
+[lib_footprint_mismatch]: Footprint 'R_Axial_DIN0207_L6.3mm_D2.5mm_P2.54mm_Vertical' does not match copy in library 'Resistor_THT'
+    Local override; warning
+    @(154.9400 mm, 87.6300 mm): Footprint JP2
+[lib_footprint_mismatch]: Footprint 'R_Axial_DIN0207_L6.3mm_D2.5mm_P2.54mm_Vertical' does not match copy in library 'Resistor_THT'
+    Local override; warning
+    @(154.8900 mm, 120.0750 mm): Footprint R5
+[lib_footprint_mismatch]: Footprint 'CP_Radial_D8.0mm_P2.50mm' does not match copy in library 'Capacitor_THT'
+    Local override; warning
+    @(210.8200 mm, 121.9200 mm): Footprint C2
+[lib_footprint_mismatch]: Footprint 'R_Axial_DIN0207_L6.3mm_D2.5mm_P2.54mm_Vertical' does not match copy in library 'Resistor_THT'
+    Local override; warning
+    @(158.1400 mm, 123.9850 mm): Footprint R2
+[lib_footprint_mismatch]: Footprint 'R_Axial_DIN0207_L6.3mm_D2.5mm_P2.54mm_Vertical' does not match copy in library 'Resistor_THT'
+    Local override; warning
+    @(158.1400 mm, 117.9850 mm): Footprint R4
+
+** Found 1 unconnected pads **
+[unconnected_items]: Missing connection between items
+    Local override; error
+    @(144.7800 mm, 115.5700 mm): Track [Net-(A3-V+)] on F.Cu, length 5.0800 mm
+    @(88.9000 mm, 132.0800 mm): PTH pad 2 [Net-(A3-V+)] of J11
+
+** Found 0 Footprint errors **
+
+** Ignored checks **
+    - Footprint has no courtyard defined
+    - Track endpoint not centered on via
+    - Tuning profile track geometries
+    - Footprint doesn't match symbol's footprint filters
+    - Text height out of range
+    - PTH inside courtyard
+    - NPTH inside courtyard
+    - Footprint component type doesn't match footprint pads
+
+** End of Report **

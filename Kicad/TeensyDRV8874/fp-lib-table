@@ -1,0 +1,6 @@
+(fp_lib_table
+  (version 7)
+  (lib (name "teensy.pretty-master")(type "KiCad")(uri "C:/Users/Andre/Documents/KiCad/8.0/footprints/teensy.pretty-master")(options "")(descr ""))
+  (lib (name "Library.Connector")(type "KiCad")(uri "C:/Astronomy/Source/Teensy/Kicad/Library.Connector.pretty")(options "")(descr ""))
+  (lib (name "OEM")(type "KiCad")(uri "${KIPRJMOD}/OEM.pretty")(options "")(descr ""))
+)
