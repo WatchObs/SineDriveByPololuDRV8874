@@ -4,3 +4,4 @@ The emphasis is control of a Right Ascension axis of an equatorial telescope as 
 The board mounted on the back of a Nema 23 stepper for the AS5047D, or if an external (glass type) ABI encoder is used, jumpers provide that programmation.
 
 ![Description](PCB.jpg)
+<img width="5184" height="3456" alt="DRV8874Stepper" src="https://github.com/user-attachments/assets/6aaa7438-d6af-4c47-8c8a-bbef964fa1bc" />
