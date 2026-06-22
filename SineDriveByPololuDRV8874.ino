@@ -68,6 +68,7 @@ const uint32_t RATE_PWM_FREQ_HZ = uStepPerTurn*5; // Debug - FOR TESTING
 const uint32_t ISR_FREQ_HZ   = 25000UL;                 // ISR ticks per second
 const uint32_t ISR_PERIOD_US = 1000000UL / ISR_FREQ_HZ; // dt in uSec
 const float    ISR_DT        = 1.f/(float)ISR_FREQ_HZ;  // dt in sec
+volatile float isrTmUs       = 0.f;                     // ISR run time micro seconds
 
 // Host rate steps/sec conversion to magnetic phase
 const float rateToDeg  = 360.f/(float)uStepPerTurn;
@@ -79,7 +80,7 @@ const int ADC_BITS = 12;
 SPISettings encSPI(10000000, MSBFIRST, SPI_MODE1);
 
 // --- Shared state (volatile for ISR/main) ---
-volatile double demandAngle   = 0.0f;   // Demanded shaft angle (degrees) fine resolution due to ISR dt integration at low slew rates
+volatile double cmdDeg        = 0.0f;   // Commanded shaft angle (degrees) fine resolution due to ISR dt integration at low slew rates
 volatile float  phaseAdv      = 0.0f;   // Phase advance
 volatile float  pE            = 0.0f;   // Position error
 volatile float  pEI           = 0.0f;   // Position error integration
@@ -113,11 +114,11 @@ const float SLEW_RATE_HZ_PER_ISR = (float)uStepPerTurn * 5.f / (float)ISR_FREQ_H
 // 15V supply, 3.0 mH, 1.00 ohms, 57BYGH633 Servo57D stepper Nema 23
 #define V_KP          0.5f   // Proportional voltage gain (normalized)
 #define V_KI          2.0f   // Integral voltage gain (normalized)
-#define SERVO_KP      1.0f   // Position error gain (was 2 with external 00ppr encoder)
-#define SERVO_KPI     0.5f   // Integrated position error gain
+#define SERVO_KP      0.7f   // Position error gain (was 2 with external 00ppr encoder)
+#define SERVO_KPI     0.2f   // Integrated position error gain
 #define SERVO_KV    0.002f   // Velocity error gain
 #define SERVO_KVI    0.01f   // Integrated velocity error gain
-const    float convCS   = (3.3f/(float)pow(2,ADC_BITS)) * (1.0f/1.1f); // CS scaling: 1.1V/A
+const    float convCS = (3.3f/(float)pow(2,ADC_BITS)) * (1.0f/1.1f); // CS scaling: 1.1V/A
 volatile float Ia    = 0.f;  // Motor coil current A
 volatile float Ib    = 0.f;  // Motor coil current B
 volatile float Id    = 0.f;  // Rotor frame current - D axis
@@ -132,9 +133,10 @@ volatile float Vq    = 0.f;  // Duty cycle Q
 volatile float IdReq = DIRECT_CURR; // Rotor frame 0 D axis requested current
 
 #define USE_EXT_ENC  1  // Use external encoder (ABI) otherwise AS5074D SPI magnetic position 14 bits
+
 #if (USE_EXT_ENC)
-#define ENC_REZ           2500     // Encoder counts per turn either phase - glass external encoder
-#define CAL_ENC_REZ (ENC_REZ *4)   // Encoder rez for calibration
+#define ENC_REZ             2500  // Encoder counts per turn either phase - glass external encoder
+#define CAL_ENC_REZ (ENC_REZ *4)  // Encoder rez for calibration
 #else
 #define ENC_REZ              512  // Encoder counts per turn either phase - AS5074D ABI default boot up value (and max)
 #define CAL_ENC_REZ    (1 << 14)  // Encoder rez for calibration 
@@ -266,8 +268,8 @@ void DRV8874(float val, int PIN_PH, int PIN_EN)
 
 void encoderIndexISR() 
 {
-  if (!releaseForUse)  // reset encoder per cycle causes tiny audible glitch
-  {
+  if (USE_EXT_ENC || !releaseForUse)  // reset encoder per cycle causes tiny audible glitch with AS5074D ABI
+  {                                    // but not with external encoder
     motorEncoder.write(0); // Zero the encoder position on index pulse
     encCnt = 0;            // Zero the tracked position
     encIndex++;
@@ -277,6 +279,8 @@ void encoderIndexISR()
 // --- ISR: measurement + integration ---
 void stepISR()
 {
+  uint32_t isrTm0 = micros();
+  
   digitalWriteFast(PIN_ISR_TOGGLE, HIGH);  // Debug
 
   isrCount++;
@@ -292,27 +296,31 @@ void stepISR()
 
   // ABI encoder counts
   encCnt = (motorEncoder.read() % ENC_QUAD_REZ) * (USE_EXT_ENC ? -1 : -1);
-  if ((encCalRun == CAL_DONE) && (encCnt < 0)) encCnt += ENC_QUAD_REZ;
+//if ((encCalRun == CAL_DONE) && (encCnt < 0)) encCnt += ENC_QUAD_REZ;
 
   // Encoder feedback, motor shaft position, magnetic angle
-  if ((USE_EXT_ENC == 0) && !magBusy)
+  if (USE_EXT_ENC == 0)
   {
-    magBusy = true;
-    magRaw  = AS5047_Read(AS5047_RAW);
-    magBusy = false;
-    magStat = magRaw & 0x4000;     // Status (error)
-    magDec  = magRaw & 0x3fff;     // 14 bit decimal position
-    magDeg  = linearize1(magDec);  // LUT linearization 
-//  magDeg  = linearize2(magDec);  // Fourrier coeff linearization
-    encDeg = (float)encCnt * (360.0f / (float)ENC_QUAD_REZ) - encOffset;
-    encDeg = limit360(encDeg);
+    if (!magBusy)
+    {
+      magBusy = true;
+      magRaw  = AS5047_Read(AS5047_RAW);
+      magBusy = false;
+      magStat = magRaw & 0x4000;     // Status (error)
+      magDec  = magRaw & 0x3fff;     // 14 bit decimal position
+      magDeg  = linearize1(magDec);  // LUT linearization 
+      magDeg  = linearize2(magDec);  // Fourrier coeff linearization
+    }
   }
   else
   {
-//  encDeg = linearize1(encCnt);  // Instabilities in certain LUT areas - to be investigated
-    encDeg = (float)encCnt * (360.0f / (float)ENC_QUAD_REZ) - encOffset;
-    encDeg = limit360(encDeg);
+    int32_t cnt = encCnt % ENC_QUAD_REZ;
+    if (cnt < 0) cnt += ENC_QUAD_REZ;
+//  encDeg = linearize1(cnt);  // Instabilities in certain LUT areas - to be investigated
   }
+  encDeg = (float)encCnt * (360.0f / (float)ENC_QUAD_REZ) - encOffset;
+  encDeg = fmodf(encDeg, 360.f);
+  encDeg = limit360(encDeg);
 
   motDeg = USE_EXT_ENC ? encDeg : magDeg;
   float temp = motDeg * MAG_CYCLES_PER_REV * (1.f/360.f);
@@ -428,9 +436,9 @@ void stepISR()
 // Debug
 //if (releaseForUse) slewFreqHz = 51200*5;
 
-  slewRate     = slewFreqHz * rateToDeg;            // degrees/sec
-  demandAngle += (double)slewRate * (double)ISR_DT; // deg/sec/iteration
-  demandAngle  = limit360D(demandAngle);            // limit to single turn
+  slewRate     = slewFreqHz * rateToDeg;       // degrees/sec
+  cmdDeg += (double)slewRate * (double)ISR_DT; // deg/sec/iteration
+  cmdDeg  = limit360D(cmdDeg);                 // limit to single turn
 
   // 4) Motor servo and current control
   if ((fabsf(slewFreqHz) < 1.f) && releaseForUse)
@@ -440,6 +448,7 @@ void stepISR()
     digitalWriteFast(PIN_A_EN, LOW);
     pinMode(PIN_B_EN, OUTPUT);
     digitalWriteFast(PIN_B_EN, LOW);
+    cmdDeg = (double)motDeg;
     pE  = 0.f;
     vE  = 0.f;
     pEI = 0.f;
@@ -472,7 +481,7 @@ void stepISR()
       }
       else if ((absFreq < transLo) && inFOC) 
       {
-        demandAngle = (double)(motDeg + Iq/IdReq);  // Align demand
+        cmdDeg = (double)(motDeg + Iq/IdReq);  // Align demand
         Vd    = .14f;
         vEI   = (slewFreqHz > 0.f) ? abs(vEI)  : -abs(vEI);
         inFOC = false;
@@ -511,15 +520,15 @@ void stepISR()
       // Direct mode
       else
       {
-        pE   = (float)demandAngle - motDeg;
+        pE   = (float)cmdDeg - motDeg;
         pE   = limit180(pE);
-        pE   = limit1(pE, 1.f);
+        pE   = limit1(pE, 2.f);
         pEI += pE * 0.0001f;
-        pEI  = limit1(pEI, 2.f);
+        pEI  = limit1(pEI, 6.f);
      
         float phaseCorr = SERVO_KP * pE + SERVO_KPI * pEI;
-        float phase = ((float)demandAngle + phaseCorr) * MAG_CYCLES_PER_REV * (1.f/360.f);
-        phase = phase - floorf(phase); 
+        float phase     = ((float)cmdDeg + phaseCorr) * MAG_CYCLES_PER_REV * (1.f/360.f);
+        phase  = phase - floorf(phase); 
         magRad = phase * 2.f * M_PI;   // Convert to Radians
      
         Vd += (IdReq - fabsf(Id)) * 0.0001f;
@@ -533,7 +542,7 @@ void stepISR()
     {
       Vd = 0.15f;
       Vq = 0.f;
-      float phase = (float)demandAngle * MAG_CYCLES_PER_REV * (1.f/360.f);
+      float phase = (float)cmdDeg * MAG_CYCLES_PER_REV * (1.f/360.f);
       magRad = (phase - (int)phase) *  2.f * M_PI;  // Convert to Radians
 
       if (encCalRun == CAL_LEARN)
@@ -541,15 +550,23 @@ void stepISR()
         static int k = 0;
 
         // Locate target table angle closest to current angle
-        while ((k<CAL_CNT) && (encCal[k].deg < (float)demandAngle)) k++;
+        while ((k<CAL_CNT) && (encCal[k].deg < (float)cmdDeg)) k++;
         if (k >= CAL_CNT) k = CAL_CNT-1;
-        while ((k>0)       && (encCal[k].deg > (float)demandAngle)) k--;
-        float diff = (float)demandAngle - encCal[k].deg;
+        while ((k>0)       && (encCal[k].deg > (float)cmdDeg)) k--;
+        float diff = (float)cmdDeg - encCal[k].deg;
         diff = limit180(diff);
         if ((encCal[k].cal != 1) && (diff > 0.f) && (diff < 0.01f))
         {
           encCal[k].cal = 1;
-          encCal[k].dec = USE_EXT_ENC ? encCnt : magDec;
+          if (USE_EXT_ENC)
+          {
+//          int32_t cnt = encCnt % ENC_QUAD_REZ;  DO NOT modulo during learning as encoder was index reset
+//          if (cnt < 0) cnt += ENC_QUAD_REZ;
+//          encCal[k].dec = cnt;
+            encCal[k].dec = encCnt;
+          }
+          else
+            encCal[k].dec = magDec;
           if (++poleNum >= CAL_CNT) encCalRun = CAL_DONE;
         }
       }
@@ -565,6 +582,8 @@ void stepISR()
 
   digitalWrite(PIN_LED, enableDrv);       // Debug
   digitalWriteFast(PIN_ISR_TOGGLE, LOW);  // Debug
+
+  isrTmUs = (float)(micros() - isrTm0);   // ISR time taken in micro seconds
 }
  
 // IntervalTimer
@@ -615,10 +634,13 @@ void setup()
   Serial2.transmitterEnable(PIN_DE_RE);
 
   // AS5074D magnetic encoder by SPI
-  pinMode(PIN_ENC_CS, OUTPUT);
-  digitalWrite(PIN_ENC_CS, HIGH);
-  SPI.begin();
-
+  if (USE_EXT_ENC == 0)
+  {
+    pinMode(PIN_ENC_CS, OUTPUT);
+    digitalWrite(PIN_ENC_CS, HIGH);
+    SPI.begin();
+  }
+  
   // start ISR timer
   stepTimer.begin(stepISR, ISR_PERIOD_US);
 }
@@ -872,7 +894,7 @@ void loop()
 
     case 3:
       // Force rotor to one pole
-      demandAngle = 0.;
+      cmdDeg = 0.;
       if ((millis() - magPoleTime) > 2000)
       {
         Serial.print("Magnetic pole found at ");
@@ -898,7 +920,7 @@ void loop()
       {
         releaseForUse = 1;
         operStep      = 10;  // Initialization completed
-        IdReq         = 0.5f * DIRECT_CURR;  // Lower direct current to reduce heating and noise
+        IdReq         = 1.0f * DIRECT_CURR;  // Lower direct current to reduce heating and noise
         buildSegments();     // Compute slope/intercepts for magnetic sensor linearization table
         fitFourier();        // Fit data to fourrier order
         Serial.println("Position sensor calibration completed");
@@ -919,7 +941,7 @@ void loop()
       break;
   }
 
-  if (!magBusy && magStat)
+  if ((USE_EXT_ENC == 0) && !magBusy && magStat)
   {
     magBusy = 1;
     //uint16_t err  = AS5047_Read(AS5047_ERRFL);
@@ -931,6 +953,7 @@ void loop()
 
   if ((operStep > 4) && (millis() - lastDebugMs >= 100) && 1)
   {
+    sTab(" isrTmUs=",       isrTmUs);
 //  sTab(" isrCount=",      isrCount);
 //  sTab(" enableDrv=",     enableDrv);
 //  sTab(" dirSign=",       dirSign);
@@ -952,10 +975,10 @@ void loop()
 //  sTab(" IaPol=",         IaPol);
 //  sTab(" IbPol=",         IbPol);
 //  sTab(" slewRate=",      slewRate);
-    sTab(" encVel=",        encVel);
-    sTab(" encVel2=",       encVel2);
+//  sTab(" encVel=",        encVel);
+//  sTab(" encVel2=",       encVel2);
     sTab(" motorVel=",      motorVel);
-    sTab(" demandAngle=",   demandAngle);
+    sTab(" cmdDeg=",        cmdDeg);
 //  sTab(" calTrg=",        calTrg);
 //  sTab(" magDeg=",        magDeg);
 //  sTab(" magDec=",        magDec);
@@ -964,8 +987,8 @@ void loop()
 //  sTab(" magDec=",        magDec);
 //  sTab(" magStat=",       magStat);
 //  sTab(" phaseAdv=",      phaseAdv);
-//  sTab(" pE=",            pE);
-//  sTab(" pEI=",           pEI);
+    sTab(" pE=",            pE);
+    sTab(" pEI=",           pEI);
 //  sTab(" vE=",            vE);
 //  sTab(" vEI=",           vEI);
 //  sTab(" vqE=",           vqE);
